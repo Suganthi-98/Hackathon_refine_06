@@ -44,6 +44,18 @@ class ImpactEstimator:
             RecommendationAction.REBALANCE_SPRINT_LOAD: self._estimate_rebalance_sprint_load,
             RecommendationAction.REMOVE_DEPENDENCY_BOTTLENECK: self._estimate_remove_dependency_bottleneck,
             RecommendationAction.ADD_RESOURCE_SKILL: self._estimate_add_resource_skill,
+            RecommendationAction.REBASELINE_ESTIMATE: self._estimate_rebaseline_estimate,
+            RecommendationAction.PAIR_REVIEWER: self._estimate_pair_reviewer,
+            RecommendationAction.ESCALATE_BLOCKER_EARLY: self._estimate_escalate_blocker_early,
+            RecommendationAction.FREEZE_SCOPE_REQUEST: self._estimate_freeze_scope_request,
+            RecommendationAction.PULL_FORWARD_ITEM: self._estimate_pull_forward_item,
+            RecommendationAction.SPLIT_AND_PAIR: self._estimate_split_and_pair,
+            RecommendationAction.ASSIGN_AS_SECOND_REVIEWER: self._estimate_assign_second_reviewer,
+            RecommendationAction.CROSS_TRAIN_BACKUP: self._estimate_cross_train_backup,
+            RecommendationAction.INSERT_REVIEW_GATE: self._estimate_insert_review_gate,
+            RecommendationAction.APPLY_RAMP_UP_DISCOUNT: self._estimate_apply_ramp_up_discount,
+            RecommendationAction.RESEQUENCE_NON_CRITICAL_ITEM: self._estimate_resequence_non_critical_item,
+            RecommendationAction.SWARM_ITEM: self._estimate_swarm_item,
         }
         estimator = dispatch.get(candidate.action_type)
         if estimator is None:
@@ -277,8 +289,8 @@ class ImpactEstimator:
             confidence=ConfidenceLevel.LOW,
             evidence=[self._evidence(
                 "CriticalPathEngine",
-                "critical_path_length",
-                cp_length,
+                "critical_path_items",
+                float(len(self.upstream.cp_result.critical_path_items)),
                 0.0,
                 "Parallelizing independent items can reduce serial dependency drag"
             )],
@@ -368,6 +380,139 @@ class ImpactEstimator:
                 "Removing a dependency bottleneck eases critical path pressure"
             )],
             notes="Impact depends on whether bottleneck is on the critical path",
+        )
+
+    def _estimate_rebaseline_estimate(self, candidate: RecommendationCandidate) -> ImpactEstimate:
+        item_hours = sum(next((wi.remaining_effort_hrs for wi in self.project_state.work_items if wi.item_id == iid), 0.0) for iid in candidate.affected_item_ids)
+        return self._build_estimate(
+            candidate,
+            hours_recovered=min(item_hours * 0.2, self.upstream.forecast.remaining_effort_hours),
+            delay_days=min(0.5, self.upstream.forecast.expected_delay_days * 0.2),
+            risk_reduction=0.08,
+            confidence=ConfidenceLevel.MEDIUM,
+            evidence=[self._evidence("ForecastEngine", "remaining_effort_hours", item_hours, 0.0, "Historical overrun pattern justifies rebaselining the estimate")],
+            notes="Rebaselining estimates based on prior overrun history reduces planning error for the affected work.",
+        )
+
+    def _estimate_pair_reviewer(self, candidate: RecommendationCandidate) -> ImpactEstimate:
+        return self._build_estimate(
+            candidate,
+            hours_recovered=10.0,
+            delay_days=0.2,
+            risk_reduction=0.05,
+            confidence=ConfidenceLevel.MEDIUM,
+            evidence=[self._evidence("MetricsEngine", "review_pairing", 1.0, 0.0, "Pairing guidance reduces rework risk on shared work")],
+            notes="Pairing a reviewer with the work reduces rework and review churn.",
+        )
+
+    def _estimate_escalate_blocker_early(self, candidate: RecommendationCandidate) -> ImpactEstimate:
+        return self._build_estimate(
+            candidate,
+            hours_recovered=min(20.0, self.upstream.forecast.remaining_effort_hours),
+            delay_days=min(1.0, self.upstream.forecast.expected_delay_days * 0.25),
+            risk_reduction=0.1,
+            confidence=ConfidenceLevel.HIGH,
+            evidence=[self._evidence("ForecastEngine", "expected_delay_days", self.upstream.forecast.expected_delay_days, 0.0, "Early escalation prevents repeated blocker loss")],
+            notes="Escalating the blocker earlier protects the schedule from repeated delay.",
+        )
+
+    def _estimate_freeze_scope_request(self, candidate: RecommendationCandidate) -> ImpactEstimate:
+        return self._build_estimate(
+            candidate,
+            hours_recovered=15.0,
+            delay_days=0.5,
+            risk_reduction=0.07,
+            confidence=ConfidenceLevel.MEDIUM,
+            evidence=[self._evidence("ForecastEngine", "scope_growth_hours", self.upstream.forecast.scope_growth_hours, 0.0, "Scope growth is the driver behind the request")],
+            notes="Freezing scope limits surprise work and preserves the planned schedule.",
+        )
+
+    def _estimate_pull_forward_item(self, candidate: RecommendationCandidate) -> ImpactEstimate:
+        return self._build_estimate(
+            candidate,
+            hours_recovered=0.0,
+            delay_days=0.3,
+            risk_reduction=0.04,
+            confidence=ConfidenceLevel.LOW,
+            evidence=[self._evidence("ForecastEngine", "expected_delay_days", self.upstream.forecast.expected_delay_days, 0.0, "Pulling work forward reduces sequencing pressure")],
+            notes="Pulling the item forward helps protect the critical path when sequencing pressure is present.",
+        )
+
+    def _estimate_split_and_pair(self, candidate: RecommendationCandidate) -> ImpactEstimate:
+        return self._build_estimate(
+            candidate,
+            hours_recovered=15.0,
+            delay_days=0.4,
+            risk_reduction=0.06,
+            confidence=ConfidenceLevel.MEDIUM,
+            evidence=[self._evidence("MetricsEngine", "average_item_effort", self.upstream.metrics.average_item_effort, 0.0, "Splitting the work keeps review handoff manageable")],
+            notes="Splitting the work and pairing it with a second reviewer reduces review contention.",
+        )
+
+    def _estimate_assign_second_reviewer(self, candidate: RecommendationCandidate) -> ImpactEstimate:
+        return self._build_estimate(
+            candidate,
+            hours_recovered=8.0,
+            delay_days=0.2,
+            risk_reduction=0.05,
+            confidence=ConfidenceLevel.MEDIUM,
+            evidence=[self._evidence("MetricsEngine", "review_pairing", 1.0, 0.0, "A second reviewer improves review throughput")],
+            notes="Assigning a second reviewer reduces review turnaround delays.",
+        )
+
+    def _estimate_cross_train_backup(self, candidate: RecommendationCandidate) -> ImpactEstimate:
+        return self._build_estimate(
+            candidate,
+            hours_recovered=12.0,
+            delay_days=0.3,
+            risk_reduction=0.09,
+            confidence=ConfidenceLevel.MEDIUM,
+            evidence=[self._evidence("RiskEngine", "resource_risk", 1.0, 0.0, "Backup coverage reduces the cost of a single-resource dependency")],
+            notes="Cross-training a backup resource reduces the tail risk of a single point of failure.",
+        )
+
+    def _estimate_insert_review_gate(self, candidate: RecommendationCandidate) -> ImpactEstimate:
+        return self._build_estimate(
+            candidate,
+            hours_recovered=10.0,
+            delay_days=0.25,
+            risk_reduction=0.06,
+            confidence=ConfidenceLevel.MEDIUM,
+            evidence=[self._evidence("MetricsEngine", "rework_loop", 1.0, 0.0, "A review gate interrupts repeated rework")],
+            notes="A review gate adds an explicit quality checkpoint before work is considered complete.",
+        )
+
+    def _estimate_apply_ramp_up_discount(self, candidate: RecommendationCandidate) -> ImpactEstimate:
+        return self._build_estimate(
+            candidate,
+            hours_recovered=8.0,
+            delay_days=0.2,
+            risk_reduction=0.05,
+            confidence=ConfidenceLevel.MEDIUM,
+            evidence=[self._evidence("ForecastEngine", "remaining_effort_hours", self.upstream.forecast.remaining_effort_hours, 0.0, "A temporary ramp-up discount improves forecast realism")],
+            notes="Applying a temporary ramp-up discount reduces forecast error for new joiners.",
+        )
+
+    def _estimate_resequence_non_critical_item(self, candidate: RecommendationCandidate) -> ImpactEstimate:
+        return self._build_estimate(
+            candidate,
+            hours_recovered=12.0,
+            delay_days=0.4,
+            risk_reduction=0.05,
+            confidence=ConfidenceLevel.MEDIUM,
+            evidence=[self._evidence("CriticalPathEngine", "critical_path_duration_hours", self.upstream.cp_result.critical_path_duration_hours or 0.0, 0.0, "Resequencing frees critical-path calendar time")],
+            notes="Moving non-critical work off the shared resource's queue improves critical-path throughput.",
+        )
+
+    def _estimate_swarm_item(self, candidate: RecommendationCandidate) -> ImpactEstimate:
+        return self._build_estimate(
+            candidate,
+            hours_recovered=20.0,
+            delay_days=0.6,
+            risk_reduction=0.08,
+            confidence=ConfidenceLevel.MEDIUM,
+            evidence=[self._evidence("CriticalPathEngine", "critical_path_duration_hours", self.upstream.cp_result.critical_path_duration_hours or 0.0, 0.0, "Swarming the bottleneck item shortens the critical path")],
+            notes="Swarming the bottleneck item can reduce critical-path delay but shifts work from another item.",
         )
 
     def _estimate_add_resource_skill(self, candidate: RecommendationCandidate) -> ImpactEstimate:

@@ -3,7 +3,9 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
-from app.domain.models import Blocker, ProjectState, SprintStatus, WorkItemStatus
+from datetime import timedelta
+
+from app.domain.models import Blocker, Priority, ProjectState, SprintStatus, WorkItemStatus
 from app.engines.critical_path_engine import CriticalPathResult
 from app.engines.dependency_engine import DependencyDAG
 from app.engines.forecast_engine import ForecastResult
@@ -13,10 +15,12 @@ from app.engines.monte_carlo_engine import MonteCarloResult
 from app.engines.risk_engine import RiskResult
 from app.engines.spillover_engine import SpilloverAnalysis
 from app.engines.recommendation_engine.models import (
+    HistoricalPattern,
     OpportunitySignal,
     SignalCategory,
     SignalEvidence,
     SignalSeverity,
+    historical_pattern_payload,
     signal_id,
 )
 
@@ -318,6 +322,618 @@ class CapacityDetector:
             return sprint.sprint_id
         not_started = next((s for s in self.project_state.sprints if getattr(s, "status", None) == SprintStatus.NOT_STARTED), None)
         return not_started.sprint_id if not_started else None
+
+
+class EstimationReliabilityDetector:
+    def __init__(self, project_state: ProjectState) -> None:
+        self.project_state = project_state
+
+    def detect(self) -> List[OpportunitySignal]:
+        signals: List[OpportunitySignal] = []
+        resources = {resource.resource_id: resource for resource in getattr(self.project_state, "team", []) if getattr(resource, "resource_id", None)}
+        for resource_id, resource in resources.items():
+            completed_items = [
+                wi for wi in self.project_state.work_items
+                if getattr(wi, "assigned_resource", None) == resource_id
+                and getattr(wi, "status", None) in {WorkItemStatus.DONE, WorkItemStatus.COMPLETED}
+            ]
+            if len(completed_items) < 2:
+                continue
+            estimate_hours = [float(getattr(wi, "current_estimate_hrs", 0.0) or getattr(wi, "estimated_effort_hrs", 0.0) or 0.0) for wi in completed_items]
+            actual_hours = [float(getattr(wi, "actual_effort_hrs", 0.0) or 0.0) for wi in completed_items]
+            ratios = [a / e if e else 0.0 for a, e in zip(actual_hours, estimate_hours) if e > 0]
+            if not ratios:
+                continue
+            ratio = sum(ratios) / len(ratios)
+            remaining_items = [
+                wi.item_id for wi in self.project_state.work_items
+                if getattr(wi, "assigned_resource", None) == resource_id
+                and getattr(wi, "status", None) in {WorkItemStatus.NOT_STARTED, WorkItemStatus.IN_PROGRESS, WorkItemStatus.BLOCKED}
+            ]
+            if not remaining_items:
+                continue
+            if ratio >= 1.3:
+                severity = SignalSeverity.HIGH
+                action_label = "overrun"
+            elif ratio <= 0.7:
+                severity = SignalSeverity.LOW
+                action_label = "underbill"
+            else:
+                continue
+            pattern = HistoricalPattern(
+                pattern_type="EstimationReliabilityDetector",
+                resource_id=resource_id,
+                blocker_category=None,
+                sample_size=len(completed_items),
+                metric_name="actual_to_estimate_ratio",
+                metric_value=round(ratio, 3),
+                historical_occurrences=[wi.item_id for wi in completed_items],
+                confidence="HIGH" if len(completed_items) >= 3 else "MEDIUM",
+            )
+            context: Dict[str, Any] = {
+                "resource_id": resource_id,
+                "ratio": round(ratio, 3),
+                "sample_size": len(completed_items),
+                "item_ids_used": [wi.item_id for wi in completed_items],
+                "remaining_item_ids": remaining_items,
+                "historical_pattern": historical_pattern_payload(pattern),
+                "action_label": action_label,
+            }
+            signals.append(
+                OpportunitySignal(
+                    signal_id=signal_id(SignalCategory.ESTIMATION_RELIABILITY, [resource_id]),
+                    category=SignalCategory.ESTIMATION_RELIABILITY,
+                    severity=severity,
+                    affected_item_ids=remaining_items,
+                    affected_resource_ids=[resource_id],
+                    affected_sprint_ids=sorted({wi.assigned_sprint for wi in self.project_state.work_items if wi.item_id in remaining_items}),
+                    affected_blocker_ids=[],
+                    evidence=[
+                        SignalEvidence(
+                            source_engine="domain_models",
+                            metric_name="actual_to_estimate_ratio",
+                            metric_value=ratio,
+                            threshold=1.3 if action_label == "overrun" else 0.7,
+                            explanation=f"{resource.name} has a repeatable estimate {action_label} pattern", 
+                        )
+                    ],
+                    context=context,
+                    detected_at=datetime.now(timezone.utc).isoformat(),
+                )
+            )
+        return signals
+
+
+class SpilloverRootCauseDetector:
+    def __init__(self, project_state: ProjectState) -> None:
+        self.project_state = project_state
+
+    def detect(self) -> List[OpportunitySignal]:
+        signals: List[OpportunitySignal] = []
+        historical_spillover_sprints = [
+            actual.sprint_number for actual in self.project_state.actuals if getattr(actual, "carryover_count", 0) > 0
+        ]
+        if not historical_spillover_sprints:
+            return signals
+        current_sprint = next((s for s in self.project_state.sprints if getattr(s, "status", None) == SprintStatus.IN_PROGRESS), None)
+        relevant_sprint_ids = {getattr(s, "sprint_id", None) for s in self.project_state.sprints if getattr(s, "status", None) in {SprintStatus.IN_PROGRESS, SprintStatus.NOT_STARTED}}
+        if current_sprint is not None:
+            relevant_sprint_ids.add(current_sprint.sprint_id)
+        target_items = [
+            wi for wi in self.project_state.work_items
+            if getattr(wi, "status", None) in {WorkItemStatus.NOT_STARTED, WorkItemStatus.IN_PROGRESS, WorkItemStatus.BLOCKED}
+            and getattr(wi, "assigned_sprint", None) in relevant_sprint_ids
+        ]
+        for item in target_items:
+            cause = self._classify_cause(item)
+            pattern = HistoricalPattern(
+                pattern_type="SpilloverRootCauseDetector",
+                resource_id=getattr(item, "assigned_resource", None),
+                blocker_category=None,
+                sample_size=len(historical_spillover_sprints),
+                metric_name="historical_carryover_count",
+                metric_value=float(sum(getattr(actual, "carryover_count", 0) for actual in self.project_state.actuals if getattr(actual, "sprint_number", 0) in historical_spillover_sprints)),
+                historical_occurrences=[f"SPR-{s}" for s in historical_spillover_sprints],
+                confidence="HIGH" if len(historical_spillover_sprints) >= 2 else "MEDIUM",
+            )
+            context: Dict[str, Any] = {
+                "cause": cause,
+                "historical_signature": {"cause": cause, "resource_id": getattr(item, "assigned_resource", None)},
+                "historical_sprints": historical_spillover_sprints,
+                "historical_pattern": historical_pattern_payload(pattern),
+            }
+            signals.append(
+                OpportunitySignal(
+                    signal_id=signal_id(SignalCategory.SPILLOVER, [item.item_id]),
+                    category=SignalCategory.SPILLOVER,
+                    severity=SignalSeverity.MEDIUM,
+                    affected_item_ids=[item.item_id],
+                    affected_resource_ids=[getattr(item, "assigned_resource", None)] if getattr(item, "assigned_resource", None) else [],
+                    affected_sprint_ids=[item.assigned_sprint],
+                    affected_blocker_ids=[],
+                    evidence=[
+                        SignalEvidence(
+                            source_engine="spillover_engine",
+                            metric_name="historical_carryover_count",
+                            metric_value=float(len(historical_spillover_sprints)),
+                            threshold=1.0,
+                            explanation="Historical sprint carryover suggests a repeatable spillover signature",
+                        )
+                    ],
+                    context=context,
+                    detected_at=datetime.now(timezone.utc).isoformat(),
+                )
+            )
+        return signals
+
+    def _classify_cause(self, item: Any) -> str:
+        active_blockers = [b for b in self.project_state.blockers if not getattr(b, "actual_resolution_date", None)]
+        related_blockers = [b for b in active_blockers if item.item_id in getattr(b, "impacted_item_ids", [])]
+        if related_blockers:
+            return "dependency_blocked"
+        if getattr(item, "assigned_resource", None) and len([wi for wi in self.project_state.work_items if getattr(wi, "assigned_resource", None) == item.assigned_resource and getattr(wi, "status", None) in {WorkItemStatus.NOT_STARTED, WorkItemStatus.IN_PROGRESS, WorkItemStatus.BLOCKED}]) > 1:
+            return "resource_unavailable"
+        if getattr(item, "is_scope_changed", False):
+            return "scope_growth"
+        if float(getattr(item, "actual_effort_hrs", 0.0) or 0.0) > float(getattr(item, "current_estimate_hrs", 0.0) or 0.0):
+            return "estimate_wrong"
+        return "toolchain_friction"
+
+
+class SPOFDetector:
+    def __init__(self, project_state: ProjectState, cp_result: Optional[CriticalPathResult] = None) -> None:
+        self.project_state = project_state
+        self.cp_result = cp_result
+
+    def detect(self) -> List[OpportunitySignal]:
+        signals: List[OpportunitySignal] = []
+        skills_to_items: Dict[str, List[Any]] = {}
+        for work_item in self.project_state.work_items:
+            skill = getattr(work_item, "required_skill", None)
+            if not skill:
+                continue
+            if self._is_critical_priority(work_item) or (self.cp_result is not None and work_item.item_id in getattr(self.cp_result, "items_on_critical_path", [])):
+                skills_to_items.setdefault(skill, []).append(work_item)
+        for skill, critical_items in skills_to_items.items():
+            assigned_resource_ids = {getattr(wi, "assigned_resource", None) for wi in critical_items if getattr(wi, "assigned_resource", None)}
+            if len(assigned_resource_ids) != 1:
+                continue
+            sole_resource_id = next(iter(assigned_resource_ids))
+            backup_resource = next(
+                (
+                    resource for resource in self.project_state.team
+                    if resource.resource_id != sole_resource_id and self._has_slack(resource)
+                ),
+                None,
+            )
+            if backup_resource is None:
+                continue
+            pattern = HistoricalPattern(
+                pattern_type="SPOFDetector",
+                resource_id=sole_resource_id,
+                blocker_category=None,
+                sample_size=1,
+                metric_name="single_resource_skill_coverage",
+                metric_value=1.0,
+                historical_occurrences=[item.item_id for item in critical_items],
+                confidence="LOW",
+            )
+            signals.append(
+                OpportunitySignal(
+                    signal_id=signal_id(SignalCategory.SPOF, [sole_resource_id]),
+                    category=SignalCategory.SPOF,
+                    severity=SignalSeverity.CRITICAL,
+                    affected_item_ids=[item.item_id for item in critical_items[:1]],
+                    affected_resource_ids=[sole_resource_id, backup_resource.resource_id],
+                    affected_sprint_ids=[item.assigned_sprint for item in critical_items[:1]],
+                    affected_blocker_ids=[],
+                    evidence=[
+                        SignalEvidence(
+                            source_engine="domain_models",
+                            metric_name="single_resource_skill_coverage",
+                            metric_value=1.0,
+                            threshold=1.0,
+                            explanation="A single resource carries the critical skill for a critical item",
+                        )
+                    ],
+                    context={
+                        "skill_name": skill,
+                        "sole_resource_id": sole_resource_id,
+                        "backup_resource_id": backup_resource.resource_id,
+                        "backup_slack_hours": round(self._slack_hours(backup_resource), 2),
+                        "historical_pattern": historical_pattern_payload(pattern),
+                    },
+                    detected_at=datetime.now(timezone.utc).isoformat(),
+                )
+            )
+        return signals
+
+    def _has_slack(self, resource: Any) -> bool:
+        return self._slack_hours(resource) > 8.0
+
+    def _is_critical_priority(self, work_item: Any) -> bool:
+        priority = getattr(work_item, "priority", None)
+        if priority is None:
+            return False
+        if isinstance(priority, Priority):
+            return priority == Priority.CRITICAL
+        if isinstance(priority, str):
+            return priority.lower() == "critical"
+        return getattr(priority, "value", None) == "Critical"
+
+    def _slack_hours(self, resource: Any) -> float:
+        assigned_remaining = sum(float(getattr(wi, "remaining_effort_hrs", 0.0) or 0.0) for wi in self.project_state.work_items if getattr(wi, "assigned_resource", None) == resource.resource_id)
+        capacity = (float(getattr(resource, "daily_capacity_hrs", 0.0) or 0.0) * float(self.project_state.project_info.sprint_duration_days or 10) * float(getattr(resource, "availability_pct", 1.0) or 1.0) * float(getattr(resource, "allocation_pct", 1.0) or 1.0))
+        return max(0.0, capacity - assigned_remaining)
+
+
+class RecurringBlockerDetector:
+    def __init__(self, project_state: ProjectState) -> None:
+        self.project_state = project_state
+
+    def detect(self) -> List[OpportunitySignal]:
+        signals: List[OpportunitySignal] = []
+        categories: Dict[str, List[Blocker]] = {}
+        for blocker in self.project_state.blockers:
+            categories.setdefault(getattr(blocker, "category", None).value if getattr(blocker, "category", None) else "Other", []).append(blocker)
+        for category, blockers in categories.items():
+            if len(blockers) < 2:
+                continue
+            active_blockers = [b for b in blockers if not getattr(b, "actual_resolution_date", None)]
+            if not active_blockers:
+                continue
+            resolution_days = []
+            for blocker in blockers:
+                raised = getattr(blocker, "raised_date", None)
+                resolved = getattr(blocker, "actual_resolution_date", None) or getattr(blocker, "target_resolution_date", None)
+                if raised and resolved:
+                    resolution_days.append((resolved - raised).days)
+            avg_days = sum(resolution_days) / len(resolution_days) if resolution_days else 5.0
+            max_days = max(resolution_days) if resolution_days else 5.0
+            for blocker in active_blockers:
+                projected_resolution = getattr(blocker, "raised_date", None) + timedelta(days=round(avg_days))
+                target = getattr(blocker, "target_resolution_date", None)
+                deadline = getattr(self.project_state.project_info, "target_end_date", None)
+                severity = SignalSeverity.CRITICAL if (target and projected_resolution > target) or (deadline and projected_resolution > deadline) else SignalSeverity.HIGH
+                pattern = HistoricalPattern(
+                    pattern_type="RecurringBlockerDetector",
+                    resource_id=getattr(blocker, "owner", None),
+                    blocker_category=category,
+                    sample_size=len(blockers),
+                    metric_name="historical_blocker_resolution_days",
+                    metric_value=round(avg_days, 2),
+                    historical_occurrences=[b.blocker_id for b in blockers],
+                    confidence="HIGH" if len(blockers) >= 3 else "MEDIUM",
+                )
+                signals.append(
+                    OpportunitySignal(
+                        signal_id=signal_id(SignalCategory.RECURRING_BLOCKER, [blocker.blocker_id]),
+                        category=SignalCategory.RECURRING_BLOCKER,
+                        severity=severity,
+                        affected_item_ids=list(getattr(blocker, "impacted_item_ids", []) or []),
+                        affected_resource_ids=[]
+                        if getattr(blocker, "owner", None) is None else [getattr(blocker, "owner", None)],
+                        affected_sprint_ids=[],
+                        affected_blocker_ids=[blocker.blocker_id],
+                        evidence=[
+                            SignalEvidence(
+                                source_engine="domain_models",
+                                metric_name="historical_blocker_resolution_days",
+                                metric_value=avg_days,
+                                threshold=avg_days,
+                                explanation=f"{category} has recurred {len(blockers)} times and is now active again",
+                            )
+                        ],
+                        context={
+                            "category": category,
+                            "owner": getattr(blocker, "owner", None),
+                            "occurrence_count": len(blockers),
+                            "avg_resolution_days": round(avg_days, 2),
+                            "max_resolution_days": round(max_days, 2),
+                            "prior_blocker_ids": [b.blocker_id for b in blockers],
+                            "historical_pattern": historical_pattern_payload(pattern),
+                        },
+                        detected_at=datetime.now(timezone.utc).isoformat(),
+                    )
+                )
+        return signals
+
+
+class ReworkLoopDetector:
+    def __init__(self, project_state: ProjectState) -> None:
+        self.project_state = project_state
+
+    def detect(self) -> List[OpportunitySignal]:
+        signals: List[OpportunitySignal] = []
+        rework_incidents = []
+        for wi in self.project_state.work_items:
+            if getattr(wi, "status", None) in {WorkItemStatus.DONE, WorkItemStatus.COMPLETED} and float(getattr(wi, "actual_effort_hrs", 0.0) or 0.0) > float(getattr(wi, "current_estimate_hrs", 0.0) or 0.0):
+                rework_incidents.append(wi)
+        if len(rework_incidents) < 2:
+            return signals
+        categories = sorted({getattr(wi, "work_type", None).value if getattr(wi, "work_type", None) else "Task" for wi in rework_incidents})
+        for category in categories:
+            upcoming_items = [
+                wi
+                for wi in self.project_state.work_items
+                if getattr(wi, "status", None) in {WorkItemStatus.NOT_STARTED, WorkItemStatus.IN_PROGRESS, WorkItemStatus.BLOCKED}
+                and (
+                    (getattr(wi, "work_type", None) is not None and getattr(wi, "work_type", None).value == category)
+                    or (getattr(wi, "work_type", None) is None and category == "Task")
+                )
+            ]
+            if not upcoming_items:
+                continue
+            pattern = HistoricalPattern(
+                pattern_type="ReworkLoopDetector",
+                resource_id=None,
+                blocker_category=category,
+                sample_size=len(rework_incidents),
+                metric_name="rework_hours",
+                metric_value=sum(float(getattr(wi, "actual_effort_hrs", 0.0) or 0.0) - float(getattr(wi, "current_estimate_hrs", 0.0) or 0.0) for wi in rework_incidents),
+                historical_occurrences=[wi.item_id for wi in rework_incidents],
+                confidence="HIGH" if len(rework_incidents) >= 3 else "MEDIUM",
+            )
+            signals.append(
+                OpportunitySignal(
+                    signal_id=signal_id(SignalCategory.REWORK_LOOP, [category]),
+                    category=SignalCategory.REWORK_LOOP,
+                    severity=SignalSeverity.HIGH,
+                    affected_item_ids=[wi.item_id for wi in upcoming_items[:2]],
+                    affected_resource_ids=[],
+                    affected_sprint_ids=[wi.assigned_sprint for wi in upcoming_items[:2]],
+                    affected_blocker_ids=[],
+                    evidence=[
+                        SignalEvidence(
+                            source_engine="domain_models",
+                            metric_name="rework_hours",
+                            metric_value=float(pattern.metric_value),
+                            threshold=10.0,
+                            explanation="The same work category has repeated rework incidents",
+                        )
+                    ],
+                    context={
+                        "category": category,
+                        "historical_item_ids": [wi.item_id for wi in rework_incidents],
+                        "rework_hours": round(pattern.metric_value, 2),
+                        "historical_pattern": historical_pattern_payload(pattern),
+                    },
+                    detected_at=datetime.now(timezone.utc).isoformat(),
+                )
+            )
+        return signals
+
+
+class RampUpDetector:
+    def __init__(self, project_state: ProjectState) -> None:
+        self.project_state = project_state
+
+    def detect(self) -> List[OpportunitySignal]:
+        signals: List[OpportunitySignal] = []
+        current_sprint_number = max((s.sprint_number for s in self.project_state.sprints), default=1)
+        for resource in self.project_state.team:
+            assigned_sprints = [
+                next((s.sprint_number for s in self.project_state.sprints if s.sprint_id == wi.assigned_sprint), None)
+                for wi in self.project_state.work_items
+                if getattr(wi, "assigned_resource", None) == resource.resource_id
+            ]
+            first_sprint_number = min([s for s in assigned_sprints if s is not None], default=current_sprint_number)
+            if current_sprint_number - first_sprint_number > 2:
+                continue
+            affected_items = [
+                wi.item_id for wi in self.project_state.work_items
+                if getattr(wi, "assigned_resource", None) == resource.resource_id
+                and getattr(wi, "status", None) in {WorkItemStatus.NOT_STARTED, WorkItemStatus.IN_PROGRESS, WorkItemStatus.BLOCKED}
+            ]
+            if not affected_items:
+                continue
+            pattern = HistoricalPattern(
+                pattern_type="RampUpDetector",
+                resource_id=resource.resource_id,
+                blocker_category=None,
+                sample_size=1,
+                metric_name="first_sprint_number",
+                metric_value=float(first_sprint_number),
+                historical_occurrences=[resource.resource_id],
+                confidence="LOW",
+            )
+            signals.append(
+                OpportunitySignal(
+                    signal_id=signal_id(SignalCategory.RAMP_UP, [resource.resource_id]),
+                    category=SignalCategory.RAMP_UP,
+                    severity=SignalSeverity.MEDIUM,
+                    affected_item_ids=affected_items,
+                    affected_resource_ids=[resource.resource_id],
+                    affected_sprint_ids=[wi.assigned_sprint for wi in self.project_state.work_items if wi.item_id in affected_items],
+                    affected_blocker_ids=[],
+                    evidence=[
+                        SignalEvidence(
+                            source_engine="domain_models",
+                            metric_name="first_sprint_number",
+                            metric_value=float(first_sprint_number),
+                            threshold=float(max(1, current_sprint_number - 2)),
+                            explanation="The resource appears to be in an early ramp-up period",
+                        )
+                    ],
+                    context={
+                        "resource_id": resource.resource_id,
+                        "joined_sprint_number": first_sprint_number,
+                        "affected_item_ids": affected_items,
+                        "historical_pattern": historical_pattern_payload(pattern),
+                    },
+                    detected_at=datetime.now(timezone.utc).isoformat(),
+                )
+            )
+        return signals
+
+
+class ResequencingDetector:
+    def __init__(self, project_state: ProjectState, dag: Optional[DependencyDAG] = None) -> None:
+        self.project_state = project_state
+        self.dag = dag
+
+    def detect(self) -> List[OpportunitySignal]:
+        signals: List[OpportunitySignal] = []
+        cp_items = [wi for wi in self.project_state.work_items if getattr(wi, "priority", None) == Priority.CRITICAL]
+        if not cp_items:
+            return signals
+        for cp_item in cp_items:
+            for other in self.project_state.work_items:
+                if other.item_id == cp_item.item_id or getattr(other, "priority", None) == Priority.CRITICAL:
+                    continue
+                if getattr(other, "assigned_resource", None) != getattr(cp_item, "assigned_resource", None):
+                    continue
+                if getattr(other, "assigned_sprint", None) not in {cp_item.assigned_sprint, self._adjacent_sprint_id(cp_item.assigned_sprint)}:
+                    continue
+                if self._has_dependency_edge(cp_item.item_id, other.item_id):
+                    continue
+                pattern = HistoricalPattern(
+                    pattern_type="ResequencingDetector",
+                    resource_id=getattr(cp_item, "assigned_resource", None),
+                    blocker_category=None,
+                    sample_size=1,
+                    metric_name="serialized_non_cp_item",
+                    metric_value=1.0,
+                    historical_occurrences=[cp_item.item_id, other.item_id],
+                    confidence="LOW",
+                )
+                signals.append(
+                    OpportunitySignal(
+                        signal_id=signal_id(SignalCategory.RESEQUENCING, [cp_item.item_id, other.item_id]),
+                        category=SignalCategory.RESEQUENCING,
+                        severity=SignalSeverity.MEDIUM,
+                        affected_item_ids=[other.item_id],
+                        affected_resource_ids=[getattr(cp_item, "assigned_resource", None)] if getattr(cp_item, "assigned_resource", None) else [],
+                        affected_sprint_ids=[cp_item.assigned_sprint],
+                        affected_blocker_ids=[],
+                        evidence=[
+                            SignalEvidence(
+                                source_engine="dependency_engine",
+                                metric_name="serialized_non_cp_item",
+                                metric_value=1.0,
+                                threshold=1.0,
+                                explanation="A non-critical item is serialized onto the same resource as critical-path work with no dependency edge",
+                            )
+                        ],
+                        context={
+                            "critical_item_id": cp_item.item_id,
+                            "non_critical_item_id": other.item_id,
+                            "hours_freed": round(float(getattr(other, "remaining_effort_hrs", 0.0) or 0.0), 2),
+                            "historical_pattern": historical_pattern_payload(pattern),
+                        },
+                        detected_at=datetime.now(timezone.utc).isoformat(),
+                    )
+                )
+                return signals
+        return signals
+
+    def _adjacent_sprint_id(self, sprint_id: str) -> Optional[str]:
+        sprint_numbers = {s.sprint_id: s.sprint_number for s in self.project_state.sprints}
+        current_number = sprint_numbers.get(sprint_id)
+        if current_number is None:
+            return None
+        for sprint in self.project_state.sprints:
+            if sprint.sprint_number == current_number + 1:
+                return sprint.sprint_id
+        return None
+
+    def _has_dependency_edge(self, predecessor_id: str, successor_id: str) -> bool:
+        return any(
+            getattr(dep, "predecessor_item_id", None) == predecessor_id and getattr(dep, "successor_item_id", None) == successor_id
+            for dep in self.project_state.dependencies
+        )
+
+
+class SwarmTradeoffDetector:
+    def __init__(self, project_state: ProjectState) -> None:
+        self.project_state = project_state
+
+    def detect(self) -> List[OpportunitySignal]:
+        signals: List[OpportunitySignal] = []
+        cp_items = [
+            wi for wi in self.project_state.work_items
+            if self._is_critical_priority(wi) and float(getattr(wi, "remaining_effort_hrs", 0.0) or 0.0) >= 20.0
+        ]
+        if not cp_items:
+            return signals
+        bottleneck = max(cp_items, key=lambda wi: float(getattr(wi, "remaining_effort_hrs", 0.0) or 0.0))
+        backup_resource = next(
+            (
+                resource for resource in self.project_state.team
+                if resource.resource_id != getattr(bottleneck, "assigned_resource", None)
+                and self._slack_hours(resource.resource_id) > 8.0
+            ),
+            None,
+        )
+        if backup_resource is None:
+            return signals
+        other_item = next(
+            (
+                wi for wi in self.project_state.work_items
+                if getattr(wi, "assigned_resource", None) == backup_resource.resource_id
+                and getattr(wi, "status", None) in {WorkItemStatus.NOT_STARTED, WorkItemStatus.IN_PROGRESS, WorkItemStatus.BLOCKED}
+            ),
+            None,
+        )
+        if other_item is None:
+            return signals
+        pattern = HistoricalPattern(
+            pattern_type="SwarmTradeoffDetector",
+            resource_id=backup_resource.resource_id,
+            blocker_category=None,
+            sample_size=1,
+            metric_name="swarm_tradeoff",
+            metric_value=1.0,
+            historical_occurrences=[bottleneck.item_id, other_item.item_id],
+            confidence="LOW",
+        )
+        signals.append(
+            OpportunitySignal(
+                signal_id=signal_id(SignalCategory.SWARM_TRADEOFF, [bottleneck.item_id]),
+                category=SignalCategory.SWARM_TRADEOFF,
+                severity=SignalSeverity.HIGH,
+                affected_item_ids=[bottleneck.item_id],
+                affected_resource_ids=[backup_resource.resource_id],
+                affected_sprint_ids=[bottleneck.assigned_sprint],
+                affected_blocker_ids=[],
+                evidence=[
+                    SignalEvidence(
+                        source_engine="critical_path_engine",
+                        metric_name="swarm_tradeoff",
+                        metric_value=1.0,
+                        threshold=1.0,
+                        explanation="Swarming the critical-path bottleneck item can save days at the cost of another item's delay",
+                    )
+                ],
+                context={
+                    "days_saved_on_critical_path": 1.5,
+                    "delay_caused_to_other_item": 0.5,
+                    "other_item_id": other_item.item_id,
+                    "other_resource_id": backup_resource.resource_id,
+                    "historical_pattern": historical_pattern_payload(pattern),
+                },
+                detected_at=datetime.now(timezone.utc).isoformat(),
+            )
+        )
+        return signals
+
+    def _is_critical_priority(self, work_item: Any) -> bool:
+        priority = getattr(work_item, "priority", None)
+        if priority is None:
+            return False
+        if isinstance(priority, Priority):
+            return priority == Priority.CRITICAL
+        if isinstance(priority, str):
+            return priority.lower() == "critical"
+        return getattr(priority, "value", None) == "Critical"
+
+    def _slack_hours(self, resource_id: str) -> float:
+        resource = next((r for r in self.project_state.team if r.resource_id == resource_id), None)
+        if resource is None:
+            return 0.0
+        assigned_remaining = sum(float(getattr(wi, "remaining_effort_hrs", 0.0) or 0.0) for wi in self.project_state.work_items if getattr(wi, "assigned_resource", None) == resource.resource_id)
+        capacity = (float(getattr(resource, "daily_capacity_hrs", 0.0) or 0.0) * float(self.project_state.project_info.sprint_duration_days or 10) * float(getattr(resource, "availability_pct", 1.0) or 1.0) * float(getattr(resource, "allocation_pct", 1.0) or 1.0))
+        return max(0.0, capacity - assigned_remaining)
 
 
 class SprintDetector:

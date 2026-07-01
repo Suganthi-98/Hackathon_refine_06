@@ -167,6 +167,7 @@ def build_recommendation_facts(recommendation: Recommendation) -> Recommendation
             )
             for ev in recommendation.impact_evidence
         ],
+        historical_pattern=(recommendation.metadata.get("historical_pattern") if isinstance(recommendation.metadata, dict) else None) or {},
     )
 
 

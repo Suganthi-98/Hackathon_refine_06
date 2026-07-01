@@ -24,6 +24,13 @@ class SignalCategory(str, Enum):
     RISK = "risk"
     SPILLOVER = "spillover"
     DEPENDENCY = "dependency"
+    ESTIMATION_RELIABILITY = "estimation_reliability"
+    SPOF = "single_point_of_failure"
+    RECURRING_BLOCKER = "recurring_blocker_category"
+    REWORK_LOOP = "rework_loop"
+    RAMP_UP = "ramp_up_discount"
+    RESEQUENCING = "resequencing_opportunity"
+    SWARM_TRADEOFF = "swarm_tradeoff"
 
 
 class SignalSeverity(str, Enum):
@@ -42,6 +49,18 @@ class RecommendationAction(str, Enum):
     REBALANCE_SPRINT_LOAD = "rebalance_sprint_load"
     REMOVE_DEPENDENCY_BOTTLENECK = "remove_dependency_bottleneck"
     ADD_RESOURCE_SKILL = "add_resource_skill"
+    REBASELINE_ESTIMATE = "rebaseline_estimate"
+    PAIR_REVIEWER = "pair_reviewer"
+    ESCALATE_BLOCKER_EARLY = "escalate_blocker_early"
+    FREEZE_SCOPE_REQUEST = "freeze_scope_request"
+    PULL_FORWARD_ITEM = "pull_forward_item"
+    SPLIT_AND_PAIR = "split_and_pair"
+    ASSIGN_AS_SECOND_REVIEWER = "assign_as_second_reviewer"
+    CROSS_TRAIN_BACKUP = "cross_train_backup"
+    INSERT_REVIEW_GATE = "insert_review_gate"
+    APPLY_RAMP_UP_DISCOUNT = "apply_ramp_up_discount"
+    RESEQUENCE_NON_CRITICAL_ITEM = "resequence_non_critical_item"
+    SWARM_ITEM = "swarm_item"
 
 
 class ConfidenceLevel(str, Enum):
@@ -57,6 +76,18 @@ class SignalEvidence:
     metric_value: float
     threshold: float
     explanation: str
+
+
+@dataclass(frozen=True)
+class HistoricalPattern:
+    pattern_type: str
+    resource_id: str | None
+    blocker_category: str | None
+    sample_size: int
+    metric_name: str
+    metric_value: float
+    historical_occurrences: List[str]
+    confidence: str
 
 
 @dataclass(frozen=True)
@@ -224,6 +255,21 @@ class UpstreamEngineOutputs:
 def stable_id(action_type: str, target_ids: List[str]) -> str:
     key = f"{action_type}:{':'.join(sorted(target_ids))}"
     return hashlib.sha1(key.encode()).hexdigest()[:10]
+
+
+def historical_pattern_payload(pattern: HistoricalPattern | None) -> Dict[str, Any] | None:
+    if pattern is None:
+        return None
+    return {
+        "pattern_type": pattern.pattern_type,
+        "resource_id": pattern.resource_id,
+        "blocker_category": pattern.blocker_category,
+        "sample_size": pattern.sample_size,
+        "metric_name": pattern.metric_name,
+        "metric_value": pattern.metric_value,
+        "historical_occurrences": pattern.historical_occurrences,
+        "confidence": pattern.confidence,
+    }
 
 
 def signal_id(category: SignalCategory, target_ids: List[str]) -> str:

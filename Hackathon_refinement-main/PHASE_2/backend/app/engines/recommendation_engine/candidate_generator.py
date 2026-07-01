@@ -18,25 +18,54 @@ class CandidateGenerator:
     def __init__(self, project_state: ProjectState, upstream: UpstreamEngineOutputs) -> None:
         self.project_state = project_state
         self.upstream = upstream
+        self._active_signal: OpportunitySignal | None = None
 
     def generate(self, signals: List[OpportunitySignal]) -> List[RecommendationCandidate]:
         emitted: Dict[str, RecommendationCandidate] = {}
         for signal in signals:
-            if signal.category == SignalCategory.BLOCKER:
-                for candidate in self._from_blocker_signal(signal):
-                    self._deduplicate(emitted, candidate)
-            elif signal.category == SignalCategory.CAPACITY:
-                for candidate in self._from_capacity_signal(signal):
-                    self._deduplicate(emitted, candidate)
-            elif signal.category == SignalCategory.SPRINT:
-                for candidate in self._from_sprint_signal(signal):
-                    self._deduplicate(emitted, candidate)
-            elif signal.category == SignalCategory.CRITICAL_PATH:
-                for candidate in self._from_critical_path_signal(signal):
-                    self._deduplicate(emitted, candidate)
-            elif signal.category == SignalCategory.SCHEDULE:
-                for candidate in self._from_schedule_signal(signal):
-                    self._deduplicate(emitted, candidate)
+            self._active_signal = signal
+            try:
+                if signal.category == SignalCategory.BLOCKER:
+                    for candidate in self._from_blocker_signal(signal):
+                        self._deduplicate(emitted, candidate)
+                elif signal.category == SignalCategory.CAPACITY:
+                    for candidate in self._from_capacity_signal(signal):
+                        self._deduplicate(emitted, candidate)
+                elif signal.category == SignalCategory.SPRINT:
+                    for candidate in self._from_sprint_signal(signal):
+                        self._deduplicate(emitted, candidate)
+                elif signal.category == SignalCategory.CRITICAL_PATH:
+                    for candidate in self._from_critical_path_signal(signal):
+                        self._deduplicate(emitted, candidate)
+                elif signal.category == SignalCategory.SCHEDULE:
+                    for candidate in self._from_schedule_signal(signal):
+                        self._deduplicate(emitted, candidate)
+                elif signal.category == SignalCategory.ESTIMATION_RELIABILITY:
+                    for candidate in self._from_estimation_signal(signal):
+                        self._deduplicate(emitted, candidate)
+                elif signal.category == SignalCategory.SPILLOVER:
+                    for candidate in self._from_spillover_signal(signal):
+                        self._deduplicate(emitted, candidate)
+                elif signal.category == SignalCategory.SPOF:
+                    for candidate in self._from_spof_signal(signal):
+                        self._deduplicate(emitted, candidate)
+                elif signal.category == SignalCategory.RECURRING_BLOCKER:
+                    for candidate in self._from_recurring_blocker_signal(signal):
+                        self._deduplicate(emitted, candidate)
+                elif signal.category == SignalCategory.REWORK_LOOP:
+                    for candidate in self._from_rework_signal(signal):
+                        self._deduplicate(emitted, candidate)
+                elif signal.category == SignalCategory.RAMP_UP:
+                    for candidate in self._from_ramp_up_signal(signal):
+                        self._deduplicate(emitted, candidate)
+                elif signal.category == SignalCategory.RESEQUENCING:
+                    for candidate in self._from_resequencing_signal(signal):
+                        self._deduplicate(emitted, candidate)
+                elif signal.category == SignalCategory.SWARM_TRADEOFF:
+                    for candidate in self._from_swarm_signal(signal):
+                        self._deduplicate(emitted, candidate)
+            finally:
+                self._active_signal = None
 
         return [candidate for candidate in emitted.values() if self._check_feasibility(candidate)]
 
@@ -313,6 +342,180 @@ class CandidateGenerator:
         
         return candidates
 
+    def _from_estimation_signal(self, signal: OpportunitySignal) -> List[RecommendationCandidate]:
+        candidates: List[RecommendationCandidate] = []
+        resource_id = (signal.context.get("resource_id") or signal.affected_resource_ids[0] if signal.affected_resource_ids else None)
+        if not resource_id:
+            return candidates
+        item_ids = signal.affected_item_ids[:1]
+        candidates.append(self._build_candidate(
+            action_type=RecommendationAction.REBASELINE_ESTIMATE,
+            title=f"Rebaseline estimates for {resource_id}",
+            description="Adjust estimates using the historical overrun pattern to improve forecast quality.",
+            affected_item_ids=item_ids,
+            affected_resource_ids=[resource_id],
+            affected_sprint_ids=signal.affected_sprint_ids,
+            affected_blocker_ids=signal.affected_blocker_ids,
+            root_signal_id=signal.signal_id,
+            simulation_params={"resource_id": resource_id},
+            feasibility_checks={"resource_exists": True},
+        ))
+        return candidates
+
+    def _from_spillover_signal(self, signal: OpportunitySignal) -> List[RecommendationCandidate]:
+        candidates: List[RecommendationCandidate] = []
+        cause = (signal.context.get("cause") or "dependency_blocked").lower()
+        action = RecommendationAction.ESCALATE_BLOCKER_EARLY
+        title = "Escalate blocker early"
+        if cause == "resource_unavailable":
+            action = RecommendationAction.REBALANCE_SPRINT_LOAD
+            title = "Rebalance sprint load"
+        elif cause == "estimate_wrong":
+            action = RecommendationAction.REBASELINE_ESTIMATE
+            title = "Rebaseline estimate"
+        elif cause == "scope_growth":
+            action = RecommendationAction.FREEZE_SCOPE_REQUEST
+            title = "Freeze scope request"
+        elif cause == "toolchain_friction":
+            action = RecommendationAction.INSERT_REVIEW_GATE
+            title = "Insert review gate"
+        item_ids = signal.affected_item_ids[:1]
+        candidates.append(self._build_candidate(
+            action_type=action,
+            title=title,
+            description="Address the recurring spillover pattern before it causes a late sprint carryover.",
+            affected_item_ids=item_ids,
+            affected_resource_ids=signal.affected_resource_ids,
+            affected_sprint_ids=signal.affected_sprint_ids,
+            affected_blocker_ids=signal.affected_blocker_ids,
+            root_signal_id=signal.signal_id,
+            simulation_params={"cause": cause},
+            feasibility_checks={"has_capacity": True},
+        ))
+        return candidates
+
+    def _from_spof_signal(self, signal: OpportunitySignal) -> List[RecommendationCandidate]:
+        candidates: List[RecommendationCandidate] = []
+        resource_id = signal.affected_resource_ids[0] if signal.affected_resource_ids else None
+        item_ids = signal.affected_item_ids[:1]
+        if not resource_id:
+            return candidates
+        candidates.append(self._build_candidate(
+            action_type=RecommendationAction.CROSS_TRAIN_BACKUP,
+            title=f"Cross-train backup for {resource_id}",
+            description="Create backup coverage for the single point of failure before it becomes a delivery issue.",
+            affected_item_ids=item_ids,
+            affected_resource_ids=[resource_id],
+            affected_sprint_ids=signal.affected_sprint_ids,
+            affected_blocker_ids=signal.affected_blocker_ids,
+            root_signal_id=signal.signal_id,
+            simulation_params={"resource_id": resource_id},
+            feasibility_checks={"resource_exists": True},
+        ))
+        return candidates
+
+    def _from_recurring_blocker_signal(self, signal: OpportunitySignal) -> List[RecommendationCandidate]:
+        candidates: List[RecommendationCandidate] = []
+        blocker_ids = signal.affected_blocker_ids[:1]
+        if not blocker_ids:
+            return candidates
+        candidates.append(self._build_candidate(
+            action_type=RecommendationAction.ESCALATE_BLOCKER_EARLY,
+            title="Escalate recurring blocker early",
+            description="Escalate the recurring blocker category earlier to avoid repeated delay.",
+            affected_item_ids=signal.affected_item_ids,
+            affected_resource_ids=signal.affected_resource_ids,
+            affected_sprint_ids=signal.affected_sprint_ids,
+            affected_blocker_ids=blocker_ids,
+            root_signal_id=signal.signal_id,
+            simulation_params={"blocker_category": signal.context.get("category")},
+            feasibility_checks={"blocker_active": True},
+        ))
+        return candidates
+
+    def _from_rework_signal(self, signal: OpportunitySignal) -> List[RecommendationCandidate]:
+        candidates: List[RecommendationCandidate] = []
+        item_ids = signal.affected_item_ids[:1]
+        candidates.append(self._build_candidate(
+            action_type=RecommendationAction.INSERT_REVIEW_GATE,
+            title="Insert review gate",
+            description="Add a review or QA gate to interrupt the rework loop before it repeats.",
+            affected_item_ids=item_ids,
+            affected_resource_ids=signal.affected_resource_ids,
+            affected_sprint_ids=signal.affected_sprint_ids,
+            affected_blocker_ids=signal.affected_blocker_ids,
+            root_signal_id=signal.signal_id,
+            simulation_params={"category": signal.context.get("category")},
+            feasibility_checks={"has_capacity": True},
+        ))
+        return candidates
+
+    def _from_ramp_up_signal(self, signal: OpportunitySignal) -> List[RecommendationCandidate]:
+        candidates: List[RecommendationCandidate] = []
+        resource_id = signal.affected_resource_ids[0] if signal.affected_resource_ids else None
+        item_ids = signal.affected_item_ids[:1]
+        if not resource_id:
+            return candidates
+        candidates.append(self._build_candidate(
+            action_type=RecommendationAction.APPLY_RAMP_UP_DISCOUNT,
+            title=f"Apply ramp-up discount for {resource_id}",
+            description="Use a temporary forecast discount for a newly ramped resource to improve estimate realism.",
+            affected_item_ids=item_ids,
+            affected_resource_ids=[resource_id],
+            affected_sprint_ids=signal.affected_sprint_ids,
+            affected_blocker_ids=signal.affected_blocker_ids,
+            root_signal_id=signal.signal_id,
+            simulation_params={"resource_id": resource_id},
+            feasibility_checks={"resource_exists": True},
+        ))
+        candidates.append(self._build_candidate(
+            action_type=RecommendationAction.PAIR_REVIEWER,
+            title=f"Pair reviewer with {resource_id}",
+            description="Pair a reviewer with the new joiner on critical path work to reduce rework risk.",
+            affected_item_ids=item_ids,
+            affected_resource_ids=[resource_id],
+            affected_sprint_ids=signal.affected_sprint_ids,
+            affected_blocker_ids=signal.affected_blocker_ids,
+            root_signal_id=signal.signal_id,
+            simulation_params={"resource_id": resource_id},
+            feasibility_checks={"resource_exists": True},
+        ))
+        return candidates
+
+    def _from_resequencing_signal(self, signal: OpportunitySignal) -> List[RecommendationCandidate]:
+        candidates: List[RecommendationCandidate] = []
+        item_ids = signal.affected_item_ids[:1]
+        candidates.append(self._build_candidate(
+            action_type=RecommendationAction.RESEQUENCE_NON_CRITICAL_ITEM,
+            title="Resequence non-critical item",
+            description="Move the non-critical item off the shared resource's plate to protect critical path work.",
+            affected_item_ids=item_ids,
+            affected_resource_ids=signal.affected_resource_ids,
+            affected_sprint_ids=signal.affected_sprint_ids,
+            affected_blocker_ids=signal.affected_blocker_ids,
+            root_signal_id=signal.signal_id,
+            simulation_params={"critical_item": signal.context.get("critical_item_id")},
+            feasibility_checks={"has_capacity": True},
+        ))
+        return candidates
+
+    def _from_swarm_signal(self, signal: OpportunitySignal) -> List[RecommendationCandidate]:
+        candidates: List[RecommendationCandidate] = []
+        item_ids = signal.affected_item_ids[:1]
+        candidates.append(self._build_candidate(
+            action_type=RecommendationAction.SWARM_ITEM,
+            title="Swarm the critical-path item",
+            description="Add a second resource to swarm the bottleneck item with explicit trade-off handling.",
+            affected_item_ids=item_ids,
+            affected_resource_ids=signal.affected_resource_ids,
+            affected_sprint_ids=signal.affected_sprint_ids,
+            affected_blocker_ids=signal.affected_blocker_ids,
+            root_signal_id=signal.signal_id,
+            simulation_params={"days_saved": signal.context.get("days_saved_on_critical_path")},
+            feasibility_checks={"resource_exists": True},
+        ))
+        return candidates
+
     def _deduplicate(self, existing: Dict[str, RecommendationCandidate], new: RecommendationCandidate) -> None:
         existing_candidate = existing.get(new.recommendation_id)
         if existing_candidate is None:
@@ -352,6 +555,13 @@ class CandidateGenerator:
         feasibility_checks: Dict[str, bool],
     ) -> RecommendationCandidate:
         target_ids = list(affected_item_ids) + list(affected_resource_ids) + list(affected_sprint_ids) + list(affected_blocker_ids)
+        merged_params = dict(simulation_params)
+        if self._active_signal is not None:
+            historical_pattern = self._active_signal.context.get("historical_pattern")
+            if historical_pattern is not None:
+                merged_params.setdefault("historical_pattern", historical_pattern)
+            if "signal_category" not in merged_params:
+                merged_params["signal_category"] = self._active_signal.category.value
         return RecommendationCandidate(
             recommendation_id=stable_id(action_type.value, target_ids),
             action_type=action_type,
@@ -363,6 +573,6 @@ class CandidateGenerator:
             affected_blocker_ids=affected_blocker_ids,
             root_cause_signal_id=root_signal_id,
             supporting_signal_ids=[root_signal_id],
-            simulation_params=simulation_params,
+            simulation_params=merged_params,
             feasibility_checks=feasibility_checks,
         )

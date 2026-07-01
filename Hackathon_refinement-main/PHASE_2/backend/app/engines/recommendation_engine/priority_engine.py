@@ -51,12 +51,19 @@ class PriorityEngine:
                     metadata={
                         "simulation_params": candidate.simulation_params,
                         "feasibility_checks": candidate.feasibility_checks,
+                        "historical_pattern": self._historical_pattern_from_candidate(candidate),
                     },
                 )
             )
 
         ranked.sort(key=lambda item: (-item.priority_score, item.recommendation_id))
         return ranked
+
+    def _historical_pattern_from_candidate(self, candidate: RecommendationCandidate) -> Dict[str, Any] | None:
+        signal_meta = candidate.simulation_params.get("historical_pattern")
+        if isinstance(signal_meta, dict):
+            return signal_meta
+        return None
 
     def _score(self, candidate: RecommendationCandidate, impact: ImpactEstimate) -> float:
         blocker_factor = 1.0 if RecommendationAction.RESOLVE_BLOCKER == candidate.action_type else 0.0
@@ -90,5 +97,11 @@ class PriorityEngine:
             + self.weights.w_capacity * capacity_factor
             + 0.1 * hours_factor
         )
+
+        if candidate.action_type in {
+            RecommendationAction.CROSS_TRAIN_BACKUP,
+            RecommendationAction.SWARM_ITEM,
+        }:
+            base_score = max(base_score, 0.65)
 
         return base_score * urgency_multiplier * cascade_multiplier * confidence_multiplier

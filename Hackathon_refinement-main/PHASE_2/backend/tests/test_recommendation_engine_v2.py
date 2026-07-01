@@ -19,6 +19,8 @@ from app.domain.models import (
     WorkItemStatus,
     WorkItemType,
 )
+from app.engines.advisor_input_builder import AdvisorInputBuilder
+from app.engines.recommendation_engine.models import RecommendationAction
 from app.engines.recommendation_engine.recommendation_engine_v2 import RecommendationEngineV2
 
 
@@ -206,3 +208,47 @@ def test_recommendation_engine_v2_exposes_validation_cache():
     validation = engine.get_validation(recommendations[0].recommendation_id)
     assert validation is not None
     assert validation.recommendation_id == recommendations[0].recommendation_id
+
+
+def test_recommendation_input_preserves_historical_pattern_for_narrative():
+    state = make_project_state()
+    engine = RecommendationEngineV2(state, simulation_count=50)
+    recommendations = engine.generate(top_n=5)
+
+    assert recommendations
+    rec = next((item for item in recommendations if item.action_type == RecommendationAction.REBASELINE_ESTIMATE), None)
+    assert rec is not None
+
+    builder = AdvisorInputBuilder()
+    advisor_input = builder.build_recommendation_input(
+        project_id="session-1",
+        project_state=state,
+        forecast=engine._compute_upstream().forecast,
+        monte_carlo=engine._compute_upstream().monte_carlo,
+        recommendations=recommendations,
+        metrics=engine._compute_upstream().metrics,
+    )
+
+    recommendation_fact = next(
+        (fact for fact in advisor_input.recommendations if fact.recommendation_id == rec.recommendation_id),
+        None,
+    )
+    assert recommendation_fact is not None
+    assert recommendation_fact.historical_pattern is not None
+    assert recommendation_fact.historical_pattern["pattern_type"]
+
+
+def test_generated_recommendations_have_historical_evidence_confidence_and_simulation_support():
+    state = make_project_state()
+    engine = RecommendationEngineV2(state, simulation_count=50)
+    recommendations = engine.generate(top_n=10)
+
+    assert recommendations
+    assert all(rec.metadata.get("historical_pattern") for rec in recommendations)
+    assert all(rec.confidence for rec in recommendations)
+    assert all(rec.estimated_hours_recovered >= 0.0 for rec in recommendations)
+    assert all(rec.estimated_delay_reduction_days >= 0.0 for rec in recommendations)
+
+    for rec in recommendations:
+        simulated = engine.simulate(rec.recommendation_id)
+        assert simulated.recommendation_ids == [rec.recommendation_id]

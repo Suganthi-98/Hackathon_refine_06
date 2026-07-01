@@ -71,6 +71,7 @@ class RecommendationFacts(BaseModel):
     affected_sprint_ids: List[str] = Field(default_factory=list)
     affected_blocker_ids: List[str] = Field(default_factory=list)
     impact_evidence: List[EvidenceItem] = Field(default_factory=list)
+    historical_pattern: Dict[str, Any] = Field(default_factory=dict)
 
     model_config = {"frozen": True}
 
