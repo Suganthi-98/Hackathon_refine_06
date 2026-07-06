@@ -72,15 +72,23 @@ class ForecastEngine:
                 spillover_hours = 0.0
 
         base_velocity = float(
-            getattr(self.metrics, "effective_project_velocity", 0.0)
-            or self.metrics.actual_avg_velocity
+            self.metrics.actual_avg_velocity
+            or getattr(self.metrics, "effective_project_velocity", 0.0)
             or self.metrics.planned_total_velocity
             or 1.0
         )
+        # NOTE: actual_avg_velocity (empirical, from historical SprintActual records) is
+        # preferred over effective_project_velocity (theoretical, capacity-based estimate)
+        # so this deterministic forecast agrees with MonteCarloEngine, which uses the same
+        # preference order. Do not swap this back without also updating monte_carlo_engine.py --
+        # the two engines disagreeing on which velocity to trust is what caused expected_delay_days
+        # and on_time_probability to contradict each other for projects where the two velocity
+        # figures diverge significantly (e.g. team is not operating near theoretical capacity).
+        # effective_project_velocity is still used as a fallback for brand-new projects with no
+        # completed sprints yet, where there is no historical data to compute actual_avg_velocity from.
         blocker_impact = float(getattr(self.metrics, "estimated_blocker_velocity_impact", 0.0) or 0.0)
 
         sprint_days = float(self.project_state.project_info.sprint_duration_days or 14)
-        velocity_without_spillover = max(base_velocity * (1.0 - blocker_impact), base_velocity * 0.25)
         # If future sprints have zero planned velocity (workbook leaves them empty),
         # substitute historical average velocity for those sprints when estimating
         # the effective remaining sprint capacity. Apply only to in-progress and
@@ -101,6 +109,11 @@ class ForecastEngine:
                     base_velocity = max(base_velocity, avg_remaining_planned_velocity)
         except Exception:
             pass
+        # Compute velocity_without_spillover AFTER the substitution above settles base_velocity --
+        # otherwise this and base_schedule_days below are derived from two different base_velocity
+        # values, and their difference gets mislabeled as blocker-caused delay when it is really
+        # just the sprint-velocity-substitution effect (reproducible even when blocker_impact == 0).
+        velocity_without_spillover = max(base_velocity * (1.0 - blocker_impact), base_velocity * 0.25)
         base_schedule_days = (adjusted_remaining / base_velocity) * sprint_days if base_velocity > 0 else 0.0
         days_without_spillover = (
             (adjusted_remaining / velocity_without_spillover) * sprint_days

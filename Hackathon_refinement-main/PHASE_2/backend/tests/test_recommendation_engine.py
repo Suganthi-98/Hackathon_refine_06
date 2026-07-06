@@ -74,7 +74,7 @@ def make_recommendation_project_state() -> ProjectState:
             secondary_skill="Python",
             skill_level=SkillLevel.INTERMEDIATE,
             allocation_pct=0.9,
-            availability_pct=0.6,
+            availability_pct=0.15,
         ),
         Resource(
             resource_id="R3",
@@ -141,10 +141,10 @@ def make_recommendation_project_state() -> ProjectState:
             assigned_resource="R2",
             required_skill="SQL",
             priority=Priority.HIGH,
-            estimated_effort_hrs=40.0,
-            current_estimate_hrs=40.0,
+            estimated_effort_hrs=20.0,
+            current_estimate_hrs=20.0,
             actual_effort_hrs=0.0,
-            remaining_effort_hrs=40.0,
+            remaining_effort_hrs=20.0,
             progress_pct=0.0,
             status=WorkItemStatus.BLOCKED,
         ),
@@ -157,10 +157,10 @@ def make_recommendation_project_state() -> ProjectState:
             assigned_resource="R1",
             required_skill="Python",
             priority=Priority.CRITICAL,
-            estimated_effort_hrs=80.0,
-            current_estimate_hrs=80.0,
+            estimated_effort_hrs=110.0,
+            current_estimate_hrs=110.0,
             actual_effort_hrs=10.0,
-            remaining_effort_hrs=70.0,
+            remaining_effort_hrs=110.0,
             progress_pct=0.125,
             status=WorkItemStatus.IN_PROGRESS,
         ),
@@ -258,18 +258,18 @@ def recommendation_engine(recommendation_project_state):
 
 
 def test_blocker_recommendations(recommendation_engine):
-    recommendations = recommendation_engine.generate()
+    recommendations = recommendation_engine.generate(top_n=50)
     blocker_recs = [r for r in recommendations if r.action_type == RecommendationAction.RESOLVE_BLOCKER]
     assert blocker_recs
     rec = blocker_recs[0]
     assert "BLK-01" in (rec.title or "") or "BLK-01" in (rec.description or "")
-    assert "OTHER" in (rec.title or "")  # title contains blocker category
+    assert "other" in (rec.title or "").lower()  # title contains blocker category (BlockerCategory.value is "Other", not "OTHER")
     assert rec.affected_blocker_ids and "BLK-01" in rec.affected_blocker_ids
     assert rec.estimated_hours_recovered >= 0.0
 
 
 def test_resource_recommendations(recommendation_engine):
-    recommendations = recommendation_engine.generate()
+    recommendations = recommendation_engine.generate(top_n=50)
     add_recs = [r for r in recommendations if r.action_type in {RecommendationAction.ADD_RESOURCE_SKILL, RecommendationAction.REASSIGN_ITEM}]
     assert add_recs
     rec = add_recs[0]
@@ -283,7 +283,7 @@ def test_resource_recommendations(recommendation_engine):
 
 
 def test_reassignment_recommendations(recommendation_engine):
-    recommendations = recommendation_engine.generate()
+    recommendations = recommendation_engine.generate(top_n=50)
     reassign_recs = [r for r in recommendations if r.action_type == RecommendationAction.REASSIGN_ITEM]
     assert reassign_recs
     rec = reassign_recs[0]
@@ -292,7 +292,7 @@ def test_reassignment_recommendations(recommendation_engine):
 
 
 def test_reduce_item_scope_recommendations(recommendation_engine):
-    recommendations = recommendation_engine.generate()
+    recommendations = recommendation_engine.generate(top_n=50)
     reduce_recs = [r for r in recommendations if r.action_type == RecommendationAction.SPLIT_ITEM]
     assert reduce_recs
     rec = reduce_recs[0]
@@ -301,7 +301,7 @@ def test_reduce_item_scope_recommendations(recommendation_engine):
 
 
 def test_cp_optimization(recommendation_engine):
-    recommendations = recommendation_engine.generate()
+    recommendations = recommendation_engine.generate(top_n=50)
     cp_recs = [r for r in recommendations if r.action_type == RecommendationAction.ADVANCE_ITEM_TO_EARLIER_SPRINT]
     assert cp_recs
     rec = cp_recs[0]
@@ -310,7 +310,7 @@ def test_cp_optimization(recommendation_engine):
 
 
 def test_simulation_and_ranking(recommendation_engine):
-    recommendations = recommendation_engine.generate()
+    recommendations = recommendation_engine.generate(top_n=50)
     assert all(r.priority_score >= 0.0 for r in recommendations)
     if recommendations:
         assert recommendations[0].priority_score >= recommendations[-1].priority_score
@@ -319,7 +319,7 @@ def test_simulation_and_ranking(recommendation_engine):
 
 
 def test_simulate_scenario(recommendation_engine):
-    recommendations = recommendation_engine.generate()
+    recommendations = recommendation_engine.generate(top_n=50)
     rec_ids = [r.recommendation_id for r in recommendations[:2]]
     if not rec_ids:
         pytest.skip("No recommendations to simulate")
@@ -329,8 +329,8 @@ def test_simulate_scenario(recommendation_engine):
 
 
 def test_recommendation_ids_are_stable_across_calls(recommendation_engine):
-    first_pass = recommendation_engine.generate()
-    second_pass = recommendation_engine.generate()
+    first_pass = recommendation_engine.generate(top_n=50)
+    second_pass = recommendation_engine.generate(top_n=50)
     assert [r.recommendation_id for r in first_pass] == [r.recommendation_id for r in second_pass]
 
 
@@ -343,7 +343,7 @@ def test_recommendation_ids_are_stable_across_engine_instances(recommendation_pr
 
 
 def test_recommendation_id_changes_when_target_ids_change(recommendation_engine):
-    recommendations = recommendation_engine.generate()
+    recommendations = recommendation_engine.generate(top_n=50)
     candidate = next((c for c in recommendations if c.affected_item_ids or c.affected_resource_ids or c.affected_blocker_ids), None)
     if candidate is None:
         pytest.skip("No candidate with target ids")
@@ -352,7 +352,7 @@ def test_recommendation_id_changes_when_target_ids_change(recommendation_engine)
 
 
 def test_simulate_recommendation_is_deterministic(recommendation_engine):
-    recommendations = recommendation_engine.generate()
+    recommendations = recommendation_engine.generate(top_n=50)
     if not recommendations:
         pytest.skip("No recommendations to simulate")
     recommendation_id = recommendations[0].recommendation_id

@@ -153,7 +153,10 @@ class CandidateGenerator:
             return candidates
 
         if is_cp_owner and flag == "OVERLOADED":
-            if item_id:
+            item = next((wi for wi in self.project_state.work_items if wi.item_id == item_id), None) if item_id else None
+            item_hours = float(getattr(item, "remaining_effort_hrs", 0.0) or 0.0) if item else 0.0
+            SPLIT_THRESHOLD_HRS = 24.0  # items larger than this are worth splitting; smaller ones are cheaper to just reassign
+            if item_id and item_hours > SPLIT_THRESHOLD_HRS:
                 candidates.append(self._build_candidate(
                     action_type=RecommendationAction.SPLIT_ITEM,
                     title=f"Split item to relieve CP owner ({item_id})",
@@ -163,13 +166,13 @@ class CandidateGenerator:
                     affected_sprint_ids=signal.affected_sprint_ids,
                     affected_blocker_ids=signal.affected_blocker_ids,
                     root_signal_id=signal.signal_id,
-                    simulation_params={"target_item_id": item_id},
+                    simulation_params={"target_item_id": item_id, "target_resource_id": resource_id},
                     feasibility_checks={"item_large_enough": True},
                 ))
             else:
                 candidates.append(self._build_candidate(
                     action_type=RecommendationAction.REASSIGN_ITEM,
-                    title=f"Reassign work ({resource_id})",
+                    title=f"Reassign work ({item_id or resource_id})",
                     description=f"Move work away from overloaded resource {resource_id}",
                     affected_item_ids=signal.affected_item_ids,
                     affected_resource_ids=[resource_id],
