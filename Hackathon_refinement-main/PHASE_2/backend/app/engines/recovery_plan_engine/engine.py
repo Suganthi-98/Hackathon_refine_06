@@ -91,11 +91,22 @@ class RecoveryPlanEngine:
         if not recommendations:
             return []
         
+        # Precompute per-recommendation simulations so SAFE plan can be
+        # constructed from measured impact (delta on-time probability / delay).
+        simulation_map: Dict[str, object] = {}
+        for rec in recommendations:
+            try:
+                scenario = self.simulation_engine.simulate(rec)
+            except Exception:
+                scenario = None
+            simulation_map[rec.recommendation_id] = scenario
+
         # Step 1: Generate candidate plans (3 archetypes)
         candidate_plans = self.generator.generate_all_archetypes(
             recommendations,
             critical_path_item_ids=critical_path_item_ids,
             resource_loads=resource_loads,
+            simulation_results=simulation_map,
         )
         
         # Step 2: Simulate each candidate plan

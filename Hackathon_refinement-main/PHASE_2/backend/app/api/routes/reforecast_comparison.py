@@ -4,9 +4,13 @@ Reforecast Comparison API Route  ← THE MONEY SHOT
 GET /api/reforecast-comparison
 
 Returns a side-by-side snapshot of three scenarios:
-  baseline   – the moment the workbook was uploaded (stored on session)
-  current    – freshest forecast + Monte Carlo run right now
+  baseline   – numbers from the shared session ProjectAnalysis (the single truth)
+  current    – same as baseline (ProjectState has not been mutated)
   after_rec  – result of the last simulate-recommendation call (stored on session)
+
+Using the shared ProjectAnalysis means these numbers always agree with what
+/forecast, /risk, and /recommendations return — previously this endpoint ran
+its own independent pipeline so values could diverge.
 """
 
 from fastapi import APIRouter, HTTPException, Query
@@ -14,42 +18,15 @@ from typing import Optional, Dict, Any
 
 from app.api.models import ApiResponse, ErrorCodes
 from app.storage import store
-from app.engines.metrics_engine import MetricsEngine
-from app.engines.dependency_engine import DependencyGraphEngine
-from app.engines.critical_path_engine import CriticalPathEngine
-from app.engines.spillover_engine import SpilloverAnalysisEngine
-from app.engines.forecast_engine import ForecastEngine
-from app.engines.monte_carlo_engine import MonteCarloEngine
-from app.engines.risk_engine import RiskEngine
-from app.engines.impact_scoring_engine import ImpactScoringEngine
 
 router = APIRouter(prefix="/api", tags=["Reforecast"])
 
-def _run_full_pipeline(project_state) -> Dict[str, Any]:
-    """Run all engines and return a compact snapshot dict."""
-    metrics_engine = MetricsEngine(project_state)
-    metrics = metrics_engine.calculate()
 
-    dep_engine = DependencyGraphEngine(project_state)
-    dag = dep_engine.build_dag()
-
-    cp_engine = CriticalPathEngine(project_state, dag)
-    cp_result = cp_engine.analyze()
-
-    spillover_engine = SpilloverAnalysisEngine(project_state, metrics.average_item_effort)
-    spillover = spillover_engine.analyze()
-
-    forecast_engine = ForecastEngine(project_state, metrics, cp_result, spillover)
-    forecast = forecast_engine.calculate()
-
-    mc_engine = MonteCarloEngine(project_state, metrics, cp_result, spillover, seed=42)
-    mc = mc_engine.simulate()
-
-    impact_engine = ImpactScoringEngine(project_state, dag)
-    impact = impact_engine.calculate()
-
-    risk_engine = RiskEngine(project_state, metrics, cp_result, spillover, mc, impact)
-    risk = risk_engine.calculate()
+def _snapshot_from_analysis(analysis) -> Dict[str, Any]:
+    """Extract the standard comparison snapshot from a ProjectAnalysis."""
+    mc = analysis.monte_carlo
+    forecast = analysis.forecast
+    risk = analysis.risk_result
 
     p50 = mc.most_likely_finish_date.isoformat() if mc.most_likely_finish_date else None
     p80 = mc.p80_finish_date.isoformat() if mc.p80_finish_date else None
@@ -58,7 +35,11 @@ def _run_full_pipeline(project_state) -> Dict[str, Any]:
 
     return {
         "on_time_probability": round(mc.on_time_probability * 100, 1),
-        "on_time_risk_level": mc.on_time_risk_level.value if hasattr(mc.on_time_risk_level, "value") else str(mc.on_time_risk_level),
+        "on_time_risk_level": (
+            mc.on_time_risk_level.value
+            if hasattr(mc.on_time_risk_level, "value")
+            else str(mc.on_time_risk_level)
+        ),
         "expected_delay_days": round(forecast.expected_delay_days, 1),
         "overall_risk_score": round(risk.overall_risk_score, 1),
         "p50_date": p50,
@@ -66,6 +47,7 @@ def _run_full_pipeline(project_state) -> Dict[str, Any]:
         "p95_date": p95,
         "target_end_date": target,
     }
+
 
 @router.get("/reforecast-comparison")
 async def get_reforecast_comparison(
@@ -84,19 +66,44 @@ async def get_reforecast_comparison(
                 ).model_dump(),
             )
 
-        project_state = session.project_state
-
-        baseline = _run_full_pipeline(project_state)
+        # Both baseline and current come from the shared session analysis —
+        # no independent engine runs, so numbers are guaranteed consistent.
+        analysis = store.get_analysis(session_id)
+        baseline = _snapshot_from_analysis(analysis)
         current = baseline.copy()
 
         after_rec_raw = getattr(session, "last_simulation_result", None)
 
         if after_rec_raw:
             after_rec = {
-                "on_time_probability": round(float(after_rec_raw.get("after_probability", after_rec_raw.get("baseline_probability", 0))) * 100, 1),
+                "on_time_probability": round(
+                    float(
+                        after_rec_raw.get(
+                            "after_probability",
+                            after_rec_raw.get("baseline_probability", 0),
+                        )
+                    ) * 100,
+                    1,
+                ),
                 "on_time_risk_level": "IMPROVED",
-                "expected_delay_days": round(float(after_rec_raw.get("after_delay_days", after_rec_raw.get("baseline_delay_days", 0))), 1),
-                "overall_risk_score": round(float(after_rec_raw.get("after_risk_score", after_rec_raw.get("baseline_risk_score", 0))), 1),
+                "expected_delay_days": round(
+                    float(
+                        after_rec_raw.get(
+                            "after_delay_days",
+                            after_rec_raw.get("baseline_delay_days", 0),
+                        )
+                    ),
+                    1,
+                ),
+                "overall_risk_score": round(
+                    float(
+                        after_rec_raw.get(
+                            "after_risk_score",
+                            after_rec_raw.get("baseline_risk_score", 0),
+                        )
+                    ),
+                    1,
+                ),
                 "p50_date": baseline.get("p50_date"),
                 "p80_date": baseline.get("p80_date"),
                 "p95_date": baseline.get("p95_date"),
@@ -113,7 +120,7 @@ async def get_reforecast_comparison(
 
         data = {
             "session_id": session_id,
-            "project_name": project_state.project_info.project_name,
+            "project_name": session.project_state.project_info.project_name,
             "baseline": baseline,
             "current": current,
             "after_recommendation": after_rec,

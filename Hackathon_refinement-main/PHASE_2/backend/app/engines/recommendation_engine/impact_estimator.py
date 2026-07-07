@@ -175,6 +175,24 @@ class ImpactEstimator:
             notes=notes,
         )
 
+    def _sum_item_remaining_effort(self, item_ids: List[str]) -> float:
+        return sum(
+            next((wi.remaining_effort_hrs for wi in self.project_state.work_items if wi.item_id == iid), 0.0)
+            for iid in item_ids
+        )
+
+    def _resource_metric(self, resource_id: str | None):
+        if not resource_id:
+            return None
+        return next(
+            (dm for dm in self.upstream.metrics.resource_metrics.developer_metrics if dm.resource_id == resource_id),
+            None,
+        )
+
+    def _is_on_critical_path(self, item_ids: List[str]) -> bool:
+        cp_items = set(self.upstream.cp_result.items_on_critical_path or [])
+        return any(item_id in cp_items for item_id in item_ids)
+
     def _estimate_split_item(self, candidate: RecommendationCandidate) -> ImpactEstimate:
         """
         Estimate impact of splitting a work item.
@@ -461,58 +479,149 @@ class ImpactEstimator:
         )
 
     def _estimate_cross_train_backup(self, candidate: RecommendationCandidate) -> ImpactEstimate:
+        target_resource_id = candidate.affected_resource_ids[0] if candidate.affected_resource_ids else None
+        resource_risk_score = float(
+            getattr(self.upstream.risk_result, "resource_risk", {}).score
+            if hasattr(self.upstream.risk_result, "resource_risk") else 0.0
+        )
+        resource_metric = self._resource_metric(target_resource_id)
+        risk_factor = min(0.08 + resource_risk_score * 0.2, 0.25)
+        if resource_metric and resource_metric.allocation_pct * resource_metric.availability_pct > 0.8:
+            risk_factor = min(risk_factor + 0.05, 0.30)
+
+        notes = (
+            "No current-window delay reduction is estimated for cross-training; "
+            "the benefit is future sprint resilience from backup coverage."
+        )
+        if target_resource_id:
+            notes += f" Target resource: {target_resource_id}."
+
         return self._build_estimate(
             candidate,
-            hours_recovered=12.0,
-            delay_days=0.3,
-            risk_reduction=0.09,
-            confidence=ConfidenceLevel.MEDIUM,
-            evidence=[self._evidence("RiskEngine", "resource_risk", 1.0, 0.0, "Backup coverage reduces the cost of a single-resource dependency")],
-            notes="Cross-training a backup resource reduces the tail risk of a single point of failure.",
+            hours_recovered=0.0,
+            delay_days=0.0,
+            risk_reduction=risk_factor,
+            confidence=ConfidenceLevel.MEDIUM if resource_risk_score > 0.1 else ConfidenceLevel.LOW,
+            evidence=[self._evidence(
+                "RiskEngine",
+                "resource_risk",
+                resource_risk_score,
+                0.0,
+                "Cross-training backup coverage reduces single-resource dependency risk",
+            )],
+            notes=notes,
         )
 
     def _estimate_insert_review_gate(self, candidate: RecommendationCandidate) -> ImpactEstimate:
+        item_hours = self._sum_item_remaining_effort(candidate.affected_item_ids)
+        is_on_cp = self._is_on_critical_path(candidate.affected_item_ids)
+        hours_recovered = min(item_hours * 0.06, self.upstream.forecast.remaining_effort_hours)
+        delay_days = min(self.upstream.forecast.expected_delay_days * (0.18 if is_on_cp else 0.1), 1.0)
+        risk_reduction = min(0.04 + (item_hours / max(1.0, self.upstream.forecast.remaining_effort_hours)) * 0.1, 0.12)
+        confidence = ConfidenceLevel.HIGH if is_on_cp else ConfidenceLevel.MEDIUM
+        notes = (
+            "A review gate reduces rework by tightening quality feedback loops and "
+            f"is estimated to recover {round(hours_recovered,1)}h of effort from the affected item(s)."
+        )
+
         return self._build_estimate(
             candidate,
-            hours_recovered=10.0,
-            delay_days=0.25,
-            risk_reduction=0.06,
-            confidence=ConfidenceLevel.MEDIUM,
-            evidence=[self._evidence("MetricsEngine", "rework_loop", 1.0, 0.0, "A review gate interrupts repeated rework")],
-            notes="A review gate adds an explicit quality checkpoint before work is considered complete.",
+            hours_recovered=hours_recovered,
+            delay_days=delay_days,
+            risk_reduction=risk_reduction,
+            confidence=confidence,
+            evidence=[self._evidence(
+                "ForecastEngine",
+                "expected_delay_days",
+                self.upstream.forecast.expected_delay_days,
+                0.0,
+                "A review gate can reduce schedule pressure by lowering rework-driven delay",
+            )],
+            notes=notes,
         )
 
     def _estimate_apply_ramp_up_discount(self, candidate: RecommendationCandidate) -> ImpactEstimate:
+        target_resource_id = candidate.affected_resource_ids[0] if candidate.affected_resource_ids else None
+        resource_metric = self._resource_metric(target_resource_id)
+        load_factor = 0.0
+        if resource_metric is not None:
+            load_factor = 1.0 - (resource_metric.allocation_pct * resource_metric.availability_pct)
+        risk_reduction = min(0.04 + max(0.0, load_factor) * 0.12, 0.12)
+        confidence = ConfidenceLevel.MEDIUM if load_factor > 0.2 else ConfidenceLevel.LOW
+        notes = (
+            "Applying a ramp-up discount improves forecast realism for a newly ramped resource "
+            "without claiming immediate current-window delay reduction."
+        )
+        if target_resource_id:
+            notes += f" Target resource: {target_resource_id}."
+
         return self._build_estimate(
             candidate,
-            hours_recovered=8.0,
-            delay_days=0.2,
-            risk_reduction=0.05,
-            confidence=ConfidenceLevel.MEDIUM,
-            evidence=[self._evidence("ForecastEngine", "remaining_effort_hours", self.upstream.forecast.remaining_effort_hours, 0.0, "A temporary ramp-up discount improves forecast realism")],
-            notes="Applying a temporary ramp-up discount reduces forecast error for new joiners.",
+            hours_recovered=0.0,
+            delay_days=0.0,
+            risk_reduction=risk_reduction,
+            confidence=confidence,
+            evidence=[self._evidence(
+                "ForecastEngine",
+                "remaining_effort_hours",
+                self.upstream.forecast.remaining_effort_hours,
+                0.0,
+                "A ramp-up discount reduces forecast error risk for new resources",
+            )],
+            notes=notes,
         )
 
     def _estimate_resequence_non_critical_item(self, candidate: RecommendationCandidate) -> ImpactEstimate:
+        item_hours = self._sum_item_remaining_effort(candidate.affected_item_ids)
+        item_fraction = item_hours / max(self.upstream.forecast.remaining_effort_hours, 1.0)
+        is_on_cp = self._is_on_critical_path(candidate.affected_item_ids)
+        hours_recovered = min(item_hours * 0.03, self.upstream.forecast.remaining_effort_hours)
+        delay_days = min(self.upstream.forecast.expected_delay_days * (0.14 if is_on_cp else 0.08) * item_fraction, 1.2)
+        risk_reduction = 0.06 if is_on_cp else 0.05
+
         return self._build_estimate(
             candidate,
-            hours_recovered=12.0,
-            delay_days=0.4,
-            risk_reduction=0.05,
+            hours_recovered=hours_recovered,
+            delay_days=delay_days,
+            risk_reduction=risk_reduction,
             confidence=ConfidenceLevel.MEDIUM,
-            evidence=[self._evidence("CriticalPathEngine", "critical_path_duration_hours", self.upstream.cp_result.critical_path_duration_hours or 0.0, 0.0, "Resequencing frees critical-path calendar time")],
-            notes="Moving non-critical work off the shared resource's queue improves critical-path throughput.",
+            evidence=[self._evidence(
+                "CriticalPathEngine",
+                "critical_path_duration_hours",
+                float(self.upstream.cp_result.critical_path_duration_hours or 0.0),
+                0.0,
+                "Resequencing non-critical work protects critical-path throughput",
+            )],
+            notes=(
+                "Resequencing non-critical work reduces shared queue pressure for affected downstream work "
+                f"and is estimated to recover {round(hours_recovered,1)}h of effort." 
+            ),
         )
 
     def _estimate_swarm_item(self, candidate: RecommendationCandidate) -> ImpactEstimate:
+        item_hours = self._sum_item_remaining_effort(candidate.affected_item_ids)
+        is_on_cp = self._is_on_critical_path(candidate.affected_item_ids)
+        hours_recovered = min(item_hours * 0.15, self.upstream.forecast.remaining_effort_hours)
+        delay_days = min(self.upstream.forecast.expected_delay_days * (0.35 if is_on_cp else 0.18), 2.0)
+        risk_reduction = 0.08 if is_on_cp else 0.05
+
         return self._build_estimate(
             candidate,
-            hours_recovered=20.0,
-            delay_days=0.6,
-            risk_reduction=0.08,
+            hours_recovered=hours_recovered,
+            delay_days=delay_days,
+            risk_reduction=risk_reduction,
             confidence=ConfidenceLevel.MEDIUM,
-            evidence=[self._evidence("CriticalPathEngine", "critical_path_duration_hours", self.upstream.cp_result.critical_path_duration_hours or 0.0, 0.0, "Swarming the bottleneck item shortens the critical path")],
-            notes="Swarming the bottleneck item can reduce critical-path delay but shifts work from another item.",
+            evidence=[self._evidence(
+                "CriticalPathEngine",
+                "critical_path_duration_hours",
+                float(self.upstream.cp_result.critical_path_duration_hours or 0.0),
+                0.0,
+                "Swarming a bottleneck item shortens critical-path duration in the current forecast window",
+            )],
+            notes=(
+                "Swarming the bottleneck item reduces the item's remaining work and critical-path pressure "
+                f"by an estimated {round(hours_recovered,1)}h."
+            ),
         )
 
     def _estimate_add_resource_skill(self, candidate: RecommendationCandidate) -> ImpactEstimate:

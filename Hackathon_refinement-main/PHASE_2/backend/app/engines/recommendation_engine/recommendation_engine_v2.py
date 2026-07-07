@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import logging
 from typing import Dict, List, Optional
 
 from app.domain.models import ProjectState
@@ -67,11 +68,12 @@ class RecommendationEngineV2:
         """
         Full pipeline:
         1. Compute upstream (with seed=42)
-        2. Detect signals (all five detectors)
+        2. Detect signals
         3. Generate candidates
-        4. Estimate impacts
-        5. Score and rank
-        6. Return top_n
+        4. Estimate impacts to triage the top candidates
+        5. Simulate the triaged set
+        6. Rank the final recommendations by measured on-time probability delta
+        7. Return top_n
         """
         upstream = self._compute_upstream()
         signals = []
@@ -94,13 +96,53 @@ class RecommendationEngineV2:
         signals.extend(self._fallback_signals(signals))
 
         candidates = CandidateGenerator(self.project_state, upstream).generate(signals)
-        impact_estimates = {candidate.recommendation_id: ImpactEstimator(self.project_state, upstream).estimate(candidate) for candidate in candidates}
-        ranked = PriorityEngine(upstream, self.scoring_weights).score_and_rank(candidates, impact_estimates)
+        impact_estimates = {
+            candidate.recommendation_id: ImpactEstimator(self.project_state, upstream).estimate(candidate)
+            for candidate in candidates
+        }
+        ranked_candidates = PriorityEngine(upstream, self.scoring_weights).score_and_rank(candidates, impact_estimates)
 
-        actionable = [rec for rec in ranked if rec.affected_item_ids or rec.affected_resource_ids or rec.affected_blocker_ids]
+        actionable = [rec for rec in ranked_candidates if rec.affected_item_ids or rec.affected_resource_ids or rec.affected_blocker_ids]
         actionable = self._deduplicate(actionable)
 
-        selected_recommendations = actionable[:top_n]
+        triage_limit = top_n * 2
+        triaged_recommendations = actionable[:triage_limit]
+        simulation_results = self._simulate_candidates(triaged_recommendations, upstream)
+
+        # Warn when estimates diverge substantially from measured simulation results.
+        # This is a lightweight guardrail to surface estimation model mismatch without failing.
+        tolerance_days = 0.5
+        for rec in triaged_recommendations:
+            est = impact_estimates.get(rec.recommendation_id)
+            sim = simulation_results.get(rec.recommendation_id)
+            if est is None or sim is None:
+                continue
+            try:
+                sim_delay = getattr(sim, "delta_expected_delay_days", 0.0)
+                est_delay = getattr(est, "estimated_delay_reduction_days", 0.0)
+                if abs(sim_delay - est_delay) > tolerance_days:
+                    logging.getLogger(__name__).warning(
+                        "Estimate/simulation divergence for %s: estimated=%.3f days, simulated=%.3f days (tolerance=%.2f)",
+                        rec.recommendation_id,
+                        est_delay,
+                        sim_delay,
+                        tolerance_days,
+                    )
+            except Exception:
+                # Never fail the pipeline for guardrail checks
+                continue
+
+        final_ranked = self._rank_by_simulation(triaged_recommendations, simulation_results)
+        selected_recommendations = final_ranked[:top_n]
+
+        # Defense-in-depth: assert there are no duplicate candidates with the same
+        # action_type and identical sorted target ids (items/resources/blockers).
+        seen_pairs = set()
+        for rec in selected_recommendations:
+            target_ids = list(rec.affected_item_ids or []) + list(rec.affected_resource_ids or []) + list(rec.affected_blocker_ids or [])
+            pair = (rec.action_type.value, tuple(sorted(target_ids)))
+            assert pair not in seen_pairs, f"Duplicate candidate detected: {pair}"
+            seen_pairs.add(pair)
 
         signals_by_id = {signal.signal_id: signal for signal in signals}
         validator = RecommendationValidator(self.project_state, upstream, signals_by_id)
@@ -147,6 +189,40 @@ class RecommendationEngineV2:
     def _run_simulation(self, recommendation: Recommendation, upstream: UpstreamEngineOutputs) -> SimulationResult:
         engine = SimulationEngineV2(self.project_state, upstream, simulation_count=self.simulation_count)
         return engine.simulate(recommendation)
+
+    def _simulate_candidates(
+        self,
+        recommendations: List[Recommendation],
+        upstream: UpstreamEngineOutputs,
+    ) -> Dict[str, SimulationResult]:
+        engine = SimulationEngineV2(self.project_state, upstream, simulation_count=self.simulation_count)
+        results: Dict[str, SimulationResult] = {}
+        for recommendation in recommendations:
+            if recommendation.recommendation_id in self._cached_simulation_results:
+                results[recommendation.recommendation_id] = self._cached_simulation_results[recommendation.recommendation_id]
+                continue
+            result = engine.simulate(recommendation)
+            results[recommendation.recommendation_id] = result
+            self._cached_simulation_results[recommendation.recommendation_id] = result
+        return results
+
+    def _rank_by_simulation(
+        self,
+        recommendations: List[Recommendation],
+        simulation_results: Dict[str, SimulationResult],
+    ) -> List[Recommendation]:
+        def sort_key(rec: Recommendation) -> tuple[float, float, float, str]:
+            result = simulation_results.get(rec.recommendation_id)
+            delta_probability = result.delta_on_time_probability if result else 0.0
+            delta_delay = result.delta_expected_delay_days if result else 0.0
+            return (
+                -delta_probability,
+                -delta_delay,
+                -rec.priority_score,
+                rec.recommendation_id,
+            )
+
+        return sorted(recommendations, key=sort_key)
 
     def simulate_scenario(self, recommendation_ids: List[str]) -> SimulationResult:
         """

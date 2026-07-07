@@ -108,6 +108,8 @@ class WorkbookParser:
             # Parse each sheet
             project_info = self._parse_project_info()
             team = self._parse_team()
+            # Keep parsed team on the parser instance for lookups when resolving work item owners
+            self.team = team
             sprint_plan_rows = self._get_sheet_data("Sprint_Plan")
             sprints = self._parse_sprints(sprint_plan_rows)
             work_items = self._parse_work_items()
@@ -497,6 +499,35 @@ class WorkbookParser:
             original_estimate = self._get_float_safe(row, "Orig Est (h)")
             estimated_effort = original_estimate if original_estimate > 0.0 else current_estimate
 
+            # Resolve Owner -> resource_id where possible. The workbook's "Owner" column
+            # historically contains a human display name; convert that to the generated
+            # `resource_id` when a matching team member exists so downstream engines
+            # can rely on `WorkItem.assigned_resource` being an id.
+            owner_raw = self._get_optional_str(row, "Owner")
+            assigned_resource_id = None
+            if owner_raw:
+                # If the team has already been parsed, prefer exact id match, then name match,
+                # then generated slug match (to tolerate slightly different spellings).
+                try:
+                    team_list = getattr(self, "team", []) or []
+                except Exception:
+                    team_list = []
+
+                owner_norm = str(owner_raw).strip()
+                # exact id match
+                if any(getattr(r, "resource_id", None) == owner_norm for r in team_list):
+                    assigned_resource_id = owner_norm
+                else:
+                    # name match
+                    matched = next((r for r in team_list if getattr(r, "name", None) == owner_norm), None)
+                    if matched:
+                        assigned_resource_id = matched.resource_id
+                    else:
+                        # fallback: generate slug and see if that matches an id
+                        slug = self._generate_resource_id(owner_norm)
+                        if any(getattr(r, "resource_id", None) == slug for r in team_list):
+                            assigned_resource_id = slug
+
             work_items.append(WorkItem(
                 item_id=item_id,
                 title=self._get_str(row, "Task Name"),
@@ -505,7 +536,7 @@ class WorkbookParser:
                 original_sprint=self._normalize_sprint_name(
                     self._get_optional_str(row, "Orig. Sprint")
                 ),
-                assigned_resource=self._get_optional_str(row, "Owner"),
+                assigned_resource=assigned_resource_id,
                 required_skill=self._get_str(row, "Required Skill"),
                 priority=self._parse_priority(row),
                 estimated_effort_hrs=estimated_effort,

@@ -261,6 +261,13 @@ async def apply_recovery_plan(
         updated_state = project_state.model_copy(deep=True)
         recovery_plan_engine.simulation_engine.applicator.apply_many(updated_state, plan_to_apply.actions)
         session.project_state = updated_state
+        # session.project_state was just replaced wholesale — any ProjectAnalysis
+        # cached against the old state is now describing a project that no
+        # longer exists. Invalidate so the next get_analysis() call (from this
+        # or any other route: /forecast, /risk, /recommendations, ...)
+        # rebuilds against the post-plan state instead of silently returning
+        # pre-plan numbers.
+        store.invalidate_analysis(session_id)
         
         response = ApplyPlanResponse(
             success=True,

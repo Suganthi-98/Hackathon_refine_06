@@ -9,9 +9,10 @@ with greedy construction. Each plan follows a distinct archetype strategy:
 """
 
 import hashlib
-from typing import List, Optional, Set
+from typing import List, Optional, Set, Dict
 
 from app.engines.recommendation_engine.models import ConfidenceLevel, Recommendation, RecommendationAction
+from app.engines.recovery_plan_engine.safe_plan_builder import SafePlanBuilder
 from app.engines.recovery_plan_engine.conflict_detector import ConflictDetector
 from app.engines.recovery_plan_engine.models import RecoveryPlanArchetype, RecoveryPlanCandidate
 
@@ -40,6 +41,7 @@ class RecoveryPlanGenerator:
         ranked_recommendations: List[Recommendation],
         critical_path_item_ids: Optional[Set[str]] = None,
         resource_loads: Optional[dict] = None,
+        simulation_results: Optional[Dict[str, object]] = None,
     ) -> List[RecoveryPlanCandidate]:
         """
         Generate three candidate plans: SAFE, AGGRESSIVE, MINIMAL_DISRUPTION.
@@ -52,7 +54,7 @@ class RecoveryPlanGenerator:
         Returns:
             List of three RecoveryPlanCandidate objects, one per archetype.
         """
-        safe_plan = self.build_safe_plan(ranked_recommendations, max_actions_override=3)
+        safe_plan = self.build_safe_plan(ranked_recommendations, max_actions_override=3, simulation_results=simulation_results)
         aggressive_plan = self.build_aggressive_plan(ranked_recommendations, max_actions_override=8)
         minimal_disruption_plan = self.build_minimal_disruption_plan(
             ranked_recommendations,
@@ -67,6 +69,7 @@ class RecoveryPlanGenerator:
         self,
         ranked_recommendations: List[Recommendation],
         max_actions_override: Optional[int] = None,
+        simulation_results: Optional[Dict[str, object]] = None,
     ) -> RecoveryPlanCandidate:
         """
         Build the SAFE plan: highest impact, lowest risk.
@@ -80,50 +83,31 @@ class RecoveryPlanGenerator:
         This produces the "safe, defensible" plan that a PM would actually recommend.
         """
         plan_cap = self.max_actions_per_plan if max_actions_override is None else max_actions_override
-        plan = []
-        used_item_ids: Set[str] = set()
-        used_resource_ids: Set[str] = set()
-        action_type_counts: dict = {}
-        candidates: List[Recommendation] = []
 
-        # Build an initial candidate list by filtering down to safe recs.
-        for rec in ranked_recommendations:
-            # Check confidence threshold: reject LOW confidence items
-            if rec.confidence == ConfidenceLevel.LOW:
-                continue
+        # Prefer simulation-driven selection when available
+        if simulation_results:
+            selected = SafePlanBuilder.build(ranked_recommendations, simulation_results, max_actions=plan_cap)
+            plan = list(selected)
+        else:
+            plan = []
+            used_item_ids: Set[str] = set()
+            used_resource_ids: Set[str] = set()
+            action_type_counts: dict = {}
+            candidates: List[Recommendation] = []
 
-            # Check for conflicts with existing plan actions or shared items is deferred until selection.
-            candidates.append(rec)
+            # Build an initial candidate list by filtering down to safe recs.
+            for rec in ranked_recommendations:
+                # Check confidence threshold: reject LOW confidence items
+                if rec.confidence == ConfidenceLevel.LOW:
+                    continue
 
-        # Phase 1: select diverse action types first.
-        for rec in candidates:
-            if len(plan) >= plan_cap:
-                break
+                # Check for conflicts with existing plan actions or shared items is deferred until selection.
+                candidates.append(rec)
 
-            if self._detect_conflict_in_plan(rec, plan):
-                continue
-
-            if set(rec.affected_item_ids) & used_item_ids:
-                continue
-
-            action_type = rec.action_type.value
-            if action_type_counts.get(action_type, 0) >= 2:
-                continue
-
-            plan.append(rec)
-            action_type_counts[action_type] = action_type_counts.get(action_type, 0) + 1
-            used_item_ids.update(rec.affected_item_ids)
-            used_resource_ids.update(rec.affected_resource_ids)
-
-        # Phase 2: if the plan is not full, allow additional recommendations even if
-        # they repeat an action type, as long as they are safe and non-conflicting.
-        if len(plan) < plan_cap:
+            # Phase 1: select diverse action types first.
             for rec in candidates:
                 if len(plan) >= plan_cap:
                     break
-
-                if rec in plan:
-                    continue
 
                 if self._detect_conflict_in_plan(rec, plan):
                     continue
@@ -131,10 +115,35 @@ class RecoveryPlanGenerator:
                 if set(rec.affected_item_ids) & used_item_ids:
                     continue
 
+                action_type = rec.action_type.value
+                if action_type_counts.get(action_type, 0) >= 2:
+                    continue
+
                 plan.append(rec)
-                action_type_counts[rec.action_type.value] = action_type_counts.get(rec.action_type.value, 0) + 1
+                action_type_counts[action_type] = action_type_counts.get(action_type, 0) + 1
                 used_item_ids.update(rec.affected_item_ids)
                 used_resource_ids.update(rec.affected_resource_ids)
+
+            # Phase 2: if the plan is not full, allow additional recommendations even if
+            # they repeat an action type, as long as they are safe and non-conflicting.
+            if len(plan) < plan_cap:
+                for rec in candidates:
+                    if len(plan) >= plan_cap:
+                        break
+
+                    if rec in plan:
+                        continue
+
+                    if self._detect_conflict_in_plan(rec, plan):
+                        continue
+
+                    if set(rec.affected_item_ids) & used_item_ids:
+                        continue
+
+                    plan.append(rec)
+                    action_type_counts[rec.action_type.value] = action_type_counts.get(rec.action_type.value, 0) + 1
+                    used_item_ids.update(rec.affected_item_ids)
+                    used_resource_ids.update(rec.affected_resource_ids)
 
         plan_id = self._generate_plan_id(RecoveryPlanArchetype.SAFE.value)
         return RecoveryPlanCandidate(

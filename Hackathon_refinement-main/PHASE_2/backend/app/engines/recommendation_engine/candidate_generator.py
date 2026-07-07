@@ -239,6 +239,7 @@ class CandidateGenerator:
                 affected_blocker_ids=signal.affected_blocker_ids,
                 root_signal_id=signal.signal_id,
                 simulation_params={"target_resource_id": resource_id, "load_ratio": load_ratio},
+                feasibility_checks={},
             ))
             return candidates
 
@@ -632,10 +633,12 @@ class CandidateGenerator:
         affected_blocker_ids: List[str],
         root_signal_id: str,
         simulation_params: Dict[str, Any],
-        feasibility_checks: Dict[str, bool],
+        feasibility_checks: Dict[str, bool] | None = None,
     ) -> RecommendationCandidate:
         target_ids = list(affected_item_ids) + list(affected_resource_ids) + list(affected_sprint_ids) + list(affected_blocker_ids)
         merged_params = dict(simulation_params)
+        # Backwards-compatibility: accept omitted feasibility_checks and normalize to empty dict
+        feasibility_checks = feasibility_checks or {}
         if self._active_signal is not None:
             historical_pattern = self._active_signal.context.get("historical_pattern")
             if historical_pattern is not None:

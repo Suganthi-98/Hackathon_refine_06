@@ -21,14 +21,7 @@ from fastapi import APIRouter, HTTPException, Query
 from app.api.models import ApiResponse, ErrorCodes
 from app.api.models_phase3 import ScopeChangeRequest, ScopeChangeResponse
 from app.domain.models import WorkItemStatus
-from app.engines.critical_path_engine import CriticalPathEngine
-from app.engines.dependency_engine import DependencyGraphEngine
-from app.engines.forecast_engine import ForecastEngine
-from app.engines.impact_scoring_engine import ImpactScoringEngine
-from app.engines.metrics_engine import MetricsEngine
-from app.engines.monte_carlo_engine import MonteCarloEngine
-from app.engines.risk_engine import RiskEngine
-from app.engines.spillover_engine import SpilloverAnalysisEngine
+from app.engines.project_analysis import ProjectAnalysis
 from app.storage import store
 
 
@@ -81,7 +74,8 @@ async def apply_scope_change(
                     ).model_dump(),
                 )
 
-        # For dry_run, clone the project state to avoid mutations
+        # For dry_run, clone the project state so nothing here ever touches
+        # the session's real ProjectState or its cached ProjectAnalysis.
         if dry_run:
             from copy import deepcopy
             project_state = deepcopy(project_state)
@@ -99,33 +93,20 @@ async def apply_scope_change(
                 work_item.progress_pct = 1.0
                 descoped_item_ids.append(item_id)
 
-        # Only persist to session if not dry_run
-        if not dry_run:
+        if dry_run:
+            # Preview only: compute a fresh, one-off ProjectAnalysis on the
+            # clone. Never touches store, never touches the cached analysis.
+            analysis = ProjectAnalysis.build(project_state, simulation_count=1000)
+        else:
+            # Confirmed: project_state here IS session.project_state (same
+            # object, mutated in place above), so the session's cached
+            # ProjectAnalysis is now stale. Invalidate before rebuilding so
+            # every other route (forecast, risk, recommendations, ...) picks
+            # up these changes on its next read instead of serving old
+            # numbers computed before the scope change.
             session.descoped_item_ids.update(descoped_item_ids)
-
-        metrics = MetricsEngine(project_state).calculate()
-        dag = DependencyGraphEngine(project_state).build_dag()
-        cp_result = CriticalPathEngine(project_state, dag).analyze()
-        spillover = SpilloverAnalysisEngine(project_state, metrics.average_item_effort).analyze()
-        forecast = ForecastEngine(project_state, metrics, cp_result, spillover).calculate()
-        monte_carlo = MonteCarloEngine(
-            project_state=project_state,
-            metrics=metrics,
-            cp_result=cp_result,
-            spillover=spillover,
-            simulation_count=1000,
-        ).calculate()
-        impact_scores = ImpactScoringEngine(project_state, dag).score()
-        risk_result = RiskEngine(
-            project_state=project_state,
-            metrics=metrics,
-            cp_result=cp_result,
-            dag=dag,
-            spillover=spillover,
-            forecast=forecast,
-            monte_carlo=monte_carlo,
-            impact_scores=impact_scores,
-        ).analyze()
+            store.invalidate_analysis(session_id)
+            analysis = store.get_analysis(session_id, simulation_count=1000)
 
         response = ScopeChangeResponse(
             session_id=session_id,
@@ -133,9 +114,9 @@ async def apply_scope_change(
             dry_run=dry_run,
             descoped_item_ids=descoped_item_ids,
             changed_item_count=len(descoped_item_ids),
-            updated_remaining_effort_hours=metrics.remaining_effort_hours,
-            forecast=forecast,
-            risk_analysis=risk_result,
+            updated_remaining_effort_hours=analysis.metrics.remaining_effort_hours,
+            forecast=analysis.forecast,
+            risk_analysis=analysis.risk_result,
         )
 
         mode_msg = "(preview)" if dry_run else "(confirmed)"

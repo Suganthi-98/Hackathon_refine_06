@@ -22,10 +22,21 @@ class Session:
         self.created_at = datetime.utcnow()
         self.last_accessed = datetime.utcnow()
         self.descoped_item_ids = set()  # For scope change tracking
+        # Lazily populated by SessionStore.get_analysis() — holds the single
+        # computed truth (ProjectAnalysis) so every route reads the same numbers.
+        self._analysis = None
     
     def touch(self) -> None:
         """Update last accessed timestamp."""
         self.last_accessed = datetime.utcnow()
+
+    def invalidate_analysis(self) -> None:
+        """
+        Drop the cached ProjectAnalysis so it is recomputed on the next
+        get_analysis() call.  Must be called whenever project_state is mutated
+        (e.g. scope change, descope).
+        """
+        self._analysis = None
 
 
 class SessionStore:
@@ -97,6 +108,50 @@ class SessionStore:
         """
         session = self.get_session(session_id)
         return session.project_state if session else None
+
+    def get_analysis(self, session_id: str, simulation_count: int = 1000):
+        """
+        Return the cached ProjectAnalysis for this session, building it on
+        the first call.
+
+        This is the single point of truth for all engine outputs.  Every API
+        route should call this instead of constructing engines independently.
+
+        Args:
+            session_id:        Session identifier.
+            simulation_count:  Monte Carlo iterations (default 1000).
+
+        Returns:
+            ProjectAnalysis or None if the session does not exist.
+        """
+        session = self.get_session(session_id)
+        if session is None:
+            return None
+
+        if session._analysis is None:
+            # Import here to avoid a module-level circular dependency.
+            from app.engines.project_analysis import ProjectAnalysis
+            session._analysis = ProjectAnalysis.build(
+                session.project_state,
+                simulation_count=simulation_count,
+            )
+
+        return session._analysis
+
+    def invalidate_analysis(self, session_id: str) -> None:
+        """
+        Drop the cached ProjectAnalysis for a session so it is rebuilt on
+        the next get_analysis() call.
+
+        Call this whenever project_state is mutated (scope change, descope,
+        blocker resolution, etc.) so routes don't serve stale numbers.
+
+        Args:
+            session_id: Session identifier.
+        """
+        session = self.get_session(session_id)
+        if session is not None:
+            session.invalidate_analysis()
     
     def delete_session(self, session_id: str) -> bool:
         """

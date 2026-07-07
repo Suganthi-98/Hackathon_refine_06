@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+import logging
 from typing import Any, Dict, List, Optional, Sequence, Union
 from uuid import uuid4
 
@@ -34,6 +35,7 @@ from app.engines.recommendation_engine.models import (
 )
 from app.engines.risk_engine import RiskEngine, RiskResult
 from app.engines.spillover_engine import SpilloverAnalysis, SpilloverAnalysisEngine
+from app.engines.forecast_levers import FORECAST_LEVER_MAP, sample_lever_values
 
 
 MONTE_CARLO_SEED: int = 42
@@ -933,6 +935,14 @@ class ActionApplicatorV2:
 
     def apply(self, state: ProjectState, rec: Recommendation) -> None:
         action_name = str(getattr(rec.action_type, "value", rec.action_type)).strip().lower()
+
+        # If the action declares forecast levers, sample those values before applying
+        declared = FORECAST_LEVER_MAP.get(rec.action_type)
+        before_samples = {}
+        if declared:
+            for path in declared:
+                before_samples[path] = sample_lever_values(state, rec, path)
+
         if action_name == "resolve_blocker":
             self._apply_resolve_blocker(state, rec)
         elif action_name == "reassign_item":
@@ -965,6 +975,24 @@ class ActionApplicatorV2:
             self._apply_resequence_non_critical_item(state, rec)
         elif action_name == "swarm_item":
             self._apply_swarm_item(state, rec)
+
+        # After apply: if declared levers exist, verify at least one changed.
+        if declared:
+            # Filter to only those lever paths that actually returned values (scoped to the rec)
+            sampled = {p: b for p, b in before_samples.items() if b}
+            if sampled:
+                unchanged = True
+                for path, before in sampled.items():
+                    after = sample_lever_values(state, rec, path)
+                    if before != after:
+                        unchanged = False
+                        break
+                if unchanged:
+                    logging.getLogger(__name__).warning(
+                        "Applicator did not modify declared forecast levers for %s: %s",
+                        rec.recommendation_id,
+                        list(sampled.keys()),
+                    )
 
     def apply_many(self, state: ProjectState, recs: List[Recommendation]) -> None:
         """Apply in lexicographic recommendation_id order for determinism."""
@@ -1283,7 +1311,35 @@ class SimulationEngineV2:
     def simulate(self, recommendation: Recommendation) -> SimulationResultV2:
         """Deep clone → apply → re-run pipeline → compute deltas."""
         cloned_state = self.project_state.model_copy(deep=True)
+
+        # Compute a lightweight fingerprint of fields the forecast uses so we can
+        # detect if the applicator silently failed to mutate state (no-op).
+        def _fingerprint(state_obj) -> str:
+            try:
+                items_sig = tuple(
+                    (
+                        wi.item_id,
+                        getattr(wi, "assigned_resource", None),
+                        round(float(getattr(wi, "remaining_effort_hrs", 0.0)), 3),
+                        getattr(wi, "assigned_sprint", None),
+                        round(float(getattr(wi, "current_estimate_hrs", 0.0)), 3),
+                    )
+                    for wi in getattr(state_obj, "work_items", [])
+                )
+                blockers_sig = tuple((b.blocker_id, b.status, getattr(b, "target_resolution_date", None)) for b in getattr(state_obj, "blockers", []))
+                team_sig = tuple((r.resource_id, r.allocation_pct, r.availability_pct) for r in getattr(state_obj, "team", []))
+                key = (items_sig, blockers_sig, team_sig)
+                return str(hash(key))
+            except Exception:
+                return ""
+
+        before_fp = _fingerprint(cloned_state)
         self.applicator.apply(cloned_state, recommendation)
+        after_fp = _fingerprint(cloned_state)
+
+        if before_fp == after_fp:
+            raise RuntimeError(f"Simulation applicator did not mutate cloned state for recommendation {recommendation.recommendation_id}")
+
         simulated = self.runner.run(cloned_state, simulation_count=self.simulation_count)
         return self._compute_result([recommendation.recommendation_id], simulated)
 

@@ -666,18 +666,17 @@ class SPOFDetector:
 
     def detect(self) -> List[OpportunitySignal]:
         signals: List[OpportunitySignal] = []
-        skills_to_items: Dict[str, List[Any]] = {}
+        resource_to_items: Dict[str, List[Any]] = {}
         for work_item in self.project_state.work_items:
+            assigned_resource = getattr(work_item, "assigned_resource", None)
             skill = getattr(work_item, "required_skill", None)
-            if not skill:
+            if not skill or not assigned_resource:
                 continue
             if self._is_critical_priority(work_item) or (self.cp_result is not None and work_item.item_id in getattr(self.cp_result, "items_on_critical_path", [])):
-                skills_to_items.setdefault(skill, []).append(work_item)
-        for skill, critical_items in skills_to_items.items():
-            assigned_resource_ids = {getattr(wi, "assigned_resource", None) for wi in critical_items if getattr(wi, "assigned_resource", None)}
-            if len(assigned_resource_ids) != 1:
-                continue
-            sole_resource_id = next(iter(assigned_resource_ids))
+                normalized_resource_id = self._normalize_resource_id(assigned_resource) or assigned_resource
+                resource_to_items.setdefault(normalized_resource_id, []).append(work_item)
+
+        for sole_resource_id, critical_items in resource_to_items.items():
             backup_resource = next(
                 (
                     resource for resource in self.project_state.team
@@ -687,6 +686,7 @@ class SPOFDetector:
             )
             if backup_resource is None:
                 continue
+            skill_names = sorted({getattr(item, "required_skill", None) for item in critical_items if getattr(item, "required_skill", None)})
             pattern = HistoricalPattern(
                 pattern_type="SPOFDetector",
                 resource_id=sole_resource_id,
@@ -702,9 +702,9 @@ class SPOFDetector:
                     signal_id=signal_id(SignalCategory.SPOF, [sole_resource_id]),
                     category=SignalCategory.SPOF,
                     severity=SignalSeverity.CRITICAL,
-                    affected_item_ids=[item.item_id for item in critical_items[:1]],
+                    affected_item_ids=[item.item_id for item in critical_items],
                     affected_resource_ids=[sole_resource_id, backup_resource.resource_id],
-                    affected_sprint_ids=[item.assigned_sprint for item in critical_items[:1]],
+                    affected_sprint_ids=[item.assigned_sprint for item in critical_items if getattr(item, "assigned_sprint", None)],
                     affected_blocker_ids=[],
                     evidence=[
                         SignalEvidence(
@@ -712,11 +712,11 @@ class SPOFDetector:
                             metric_name="single_resource_skill_coverage",
                             metric_value=1.0,
                             threshold=1.0,
-                            explanation="A single resource carries the critical skill for a critical item",
+                            explanation="A single resource carries the critical work across one or more skills",
                         )
                     ],
                     context={
-                        "skill_name": skill,
+                        "skill_names": skill_names,
                         "sole_resource_id": sole_resource_id,
                         "backup_resource_id": backup_resource.resource_id,
                         "backup_slack_hours": round(self._slack_hours(backup_resource), 2),
@@ -726,6 +726,16 @@ class SPOFDetector:
                 )
             )
         return signals
+
+    def _normalize_resource_id(self, assigned_resource: str) -> Optional[str]:
+        matched = next(
+            (
+                r for r in self.project_state.team
+                if getattr(r, "resource_id", None) == assigned_resource or getattr(r, "name", None) == assigned_resource
+            ),
+            None,
+        )
+        return matched.resource_id if matched else None
 
     def _has_slack(self, resource: Any) -> bool:
         return self._slack_hours(resource) > 8.0

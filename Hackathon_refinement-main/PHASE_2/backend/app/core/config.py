@@ -4,6 +4,7 @@ All simulation parameters and constants in one place.
 Never hardcode configuration values inline.
 """
 
+from pathlib import Path
 from typing import Dict
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -71,7 +72,9 @@ class Settings(BaseSettings):
     allowed_extensions: list = [".xlsx"]  # Fixed list, not from .env
 
     # ─── Demo Mode ───────────────────────────────────────────────────────────
-    demo_workbook_path: str = "PHASE_2/INPUT/TIO2_Sprint_Intelligence_v5_final.xlsx"
+    demo_workbook_path: str = str(
+        Path(__file__).resolve().parents[3] / "INPUT" / "TIO2_Sprint_Intelligence_v5_final.xlsx"
+    )
     frontend_origin: str | None = None
 
     model_config = SettingsConfigDict(

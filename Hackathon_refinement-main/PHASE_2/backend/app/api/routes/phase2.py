@@ -1,9 +1,12 @@
 """
 Phase 2 API Routes
 
-GET /metrics - Project metrics
+GET /metrics     - Project metrics
 GET /dependencies - Dependency graph analysis
-GET /spillover - Spillover analysis
+GET /spillover   - Spillover analysis
+
+All three endpoints read from the session-level ProjectAnalysis (computed
+once per session) so numbers are always consistent across the whole API.
 """
 
 from fastapi import APIRouter, HTTPException, Query
@@ -11,39 +14,35 @@ from app.storage import store
 from app.api.models import ApiResponse, ErrorCodes
 from app.api.models_phase2 import MetricsResponse, DependenciesResponse, SpilloverResponse
 
-from app.engines.metrics_engine import MetricsEngine
-from app.engines.dependency_engine import DependencyGraphEngine
-from app.engines.critical_path_engine import CriticalPathEngine
-from app.engines.impact_scoring_engine import ImpactScoringEngine
-from app.engines.spillover_engine import SpilloverAnalysisEngine
-
 router = APIRouter(prefix="/api", tags=["Phase2"])
+
+
+def _get_analysis(session_id: str):
+    analysis = store.get_analysis(session_id)
+    if not analysis:
+        raise HTTPException(
+            status_code=404,
+            detail=ApiResponse(
+                success=False,
+                error_code=ErrorCodes.SESSION_NOT_FOUND,
+                message=f"Session {session_id} not found",
+            ).model_dump(),
+        )
+    return analysis
 
 
 @router.get("/metrics")
 async def get_metrics(session_id: str = Query(..., description="Session ID")):
     """
     Get project metrics for a session.
-    
+
     Returns aggregated metrics including completion %, velocity, team utilization, and risk indicators.
     """
     try:
-        project_state = store.get_project_state(session_id)
-        if not project_state:
-            raise HTTPException(
-                status_code=404,
-                detail=ApiResponse(
-                    success=False,
-                    error_code=ErrorCodes.SESSION_NOT_FOUND,
-                    message=f"Session {session_id} not found",
-                ).model_dump()
-            )
-        
-        # Calculate metrics
-        metrics_engine = MetricsEngine(project_state)
-        metrics = metrics_engine.calculate()
-        
-        # Build response
+        analysis = _get_analysis(session_id)
+        metrics = analysis.metrics
+        project_state = analysis.project_state
+
         response = MetricsResponse(
             session_id=session_id,
             project_name=project_state.project_info.project_name,
@@ -69,12 +68,9 @@ async def get_metrics(session_id: str = Query(..., description="Session ID")):
             dependency_count=metrics.dependency_count,
             expected_spillover_items=int(metrics.expected_spillover_items),
         )
-        
-        return ApiResponse(
-            success=True,
-            data=response.model_dump(),
-        )
-    
+
+        return ApiResponse(success=True, data=response.model_dump())
+
     except HTTPException:
         raise
     except Exception as e:
@@ -84,7 +80,7 @@ async def get_metrics(session_id: str = Query(..., description="Session ID")):
                 success=False,
                 error_code=ErrorCodes.PROCESSING_ERROR,
                 message=f"Error calculating metrics: {str(e)}",
-            ).model_dump()
+            ).model_dump(),
         )
 
 
@@ -92,39 +88,22 @@ async def get_metrics(session_id: str = Query(..., description="Session ID")):
 async def get_dependencies(session_id: str = Query(..., description="Session ID")):
     """
     Get dependency graph analysis and critical path.
-    
+
     Returns DAG structure, critical path, risk items, and blocker impacts.
     """
     try:
-        project_state = store.get_project_state(session_id)
-        if not project_state:
-            raise HTTPException(
-                status_code=404,
-                detail=ApiResponse(
-                    success=False,
-                    error_code=ErrorCodes.SESSION_NOT_FOUND,
-                    message=f"Session {session_id} not found",
-                ).model_dump()
-            )
-        
-        # Build dependency DAG
-        dep_engine = DependencyGraphEngine(project_state)
-        dag = dep_engine.build_dag()
-        
-        # Analyze critical path
-        cp_engine = CriticalPathEngine(project_state, dag)
-        cp_result = cp_engine.analyze()
-        
-        # Score impacts from blockers and dependencies
-        impact_engine = ImpactScoringEngine(project_state, dag)
-        risk_scores = impact_engine.score()
-        
+        analysis = _get_analysis(session_id)
+        project_state = analysis.project_state
+        dag = analysis.dag
+        cp_result = analysis.cp_result
+        risk_scores = analysis.impact_scores
+
         # Identify blocked items
         blocked_items = set()
         for blocker in project_state.blockers:
-            if not blocker.actual_resolution_date:  # Active blocker
+            if not blocker.actual_resolution_date:
                 blocked_items.update(blocker.impacted_item_ids)
-        
+
         # Build detailed critical path payload
         work_items_by_id = {wi.item_id: wi for wi in project_state.work_items}
         critical_path_details = []
@@ -142,7 +121,6 @@ async def get_dependencies(session_id: str = Query(..., description="Session ID"
                 "sprint_id": work_item.assigned_sprint,
             })
 
-        # Build response
         response = DependenciesResponse(
             session_id=session_id,
             project_name=project_state.project_info.project_name,
@@ -167,12 +145,9 @@ async def get_dependencies(session_id: str = Query(..., description="Session ID"
             items_blocked=list(blocked_items),
             zero_slack_items=cp_result.items_on_critical_path,
         )
-        
-        return ApiResponse(
-            success=True,
-            data=response.model_dump(),
-        )
-    
+
+        return ApiResponse(success=True, data=response.model_dump())
+
     except HTTPException:
         raise
     except Exception as e:
@@ -182,7 +157,7 @@ async def get_dependencies(session_id: str = Query(..., description="Session ID"
                 success=False,
                 error_code=ErrorCodes.PROCESSING_ERROR,
                 message=f"Error analyzing dependencies: {str(e)}",
-            ).model_dump()
+            ).model_dump(),
         )
 
 
@@ -190,44 +165,30 @@ async def get_dependencies(session_id: str = Query(..., description="Session ID"
 async def get_spillover(session_id: str = Query(..., description="Session ID")):
     """
     Get spillover analysis and capacity predictions.
-    
+
     Returns spillover probabilities per item, predicted carryover by sprint, and capacity utilization.
     """
     try:
-        project_state = store.get_project_state(session_id)
-        if not project_state:
-            raise HTTPException(
-                status_code=404,
-                detail=ApiResponse(
-                    success=False,
-                    error_code=ErrorCodes.SESSION_NOT_FOUND,
-                    message=f"Session {session_id} not found",
-                ).model_dump()
-            )
-        
-        # Analyze spillover
-        metrics = MetricsEngine(project_state).calculate()
-        spillover_engine = SpilloverAnalysisEngine(project_state, metrics.average_item_effort)
-        spillover_analysis = spillover_engine.analyze()
-        
+        analysis = _get_analysis(session_id)
+        project_state = analysis.project_state
+        spillover_analysis = analysis.spillover
+
         # Determine overall risk level
         high_risk_count = len(spillover_analysis.high_spillover_risk_items)
         total_expected = sum(spillover_analysis.predicted_spillover_by_sprint.values())
-        
+
         if high_risk_count >= 5 or total_expected >= 10:
             risk_level = "High"
         elif high_risk_count >= 2 or total_expected >= 5:
             risk_level = "Medium"
         else:
             risk_level = "Low"
-        
-        # Convert confidence intervals to dict format for JSON serialization
+
         confidence_dict = {
-            str(k): (v[0], v[1]) 
+            str(k): (v[0], v[1])
             for k, v in spillover_analysis.spillover_confidence_intervals.items()
         }
-        
-        # Build response
+
         response = SpilloverResponse(
             session_id=session_id,
             project_name=project_state.project_info.project_name,
@@ -245,12 +206,9 @@ async def get_spillover(session_id: str = Query(..., description="Session ID")):
             total_expected_spillover=total_expected,
             risk_level=risk_level,
         )
-        
-        return ApiResponse(
-            success=True,
-            data=response.model_dump(),
-        )
-    
+
+        return ApiResponse(success=True, data=response.model_dump())
+
     except HTTPException:
         raise
     except Exception as e:
@@ -260,5 +218,5 @@ async def get_spillover(session_id: str = Query(..., description="Session ID")):
                 success=False,
                 error_code=ErrorCodes.PROCESSING_ERROR,
                 message=f"Error analyzing spillover: {str(e)}",
-            ).model_dump()
+            ).model_dump(),
         )

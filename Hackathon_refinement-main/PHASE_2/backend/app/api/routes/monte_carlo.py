@@ -2,17 +2,18 @@
 Phase 3.2 Monte Carlo API Route
 
 GET /monte-carlo - probabilistic forecast with confidence intervals
+
+Default (no query params): returns the cached session-level Monte Carlo result
+so numbers agree exactly with /forecast, /risk, and /recommendations.
+
+With explicit simulations/seed params: re-runs a fresh simulation for custom
+what-if exploration (does NOT invalidate the session cache).
 """
 from fastapi import APIRouter, HTTPException, Query
+from typing import Optional
 from app.storage import store
 from app.api.models import ApiResponse, ErrorCodes
 from app.api.models_phase3 import MonteCarloResponse
-
-from app.engines.metrics_engine import MetricsEngine
-from app.engines.dependency_engine import DependencyGraphEngine
-from app.engines.critical_path_engine import CriticalPathEngine
-from app.engines.spillover_engine import SpilloverAnalysisEngine
-from app.engines.monte_carlo_engine import MonteCarloEngine
 
 router = APIRouter(prefix="/api", tags=["Phase3.2"])
 
@@ -20,79 +21,112 @@ router = APIRouter(prefix="/api", tags=["Phase3.2"])
 @router.get("/monte-carlo")
 async def get_monte_carlo(
     session_id: str = Query(..., description="Session ID"),
-    simulations: int = Query(10000, description="Number of simulations (default 10000)", ge=100, le=100000),
-    seed: int = Query(None, description="Random seed for reproducibility (optional)"),
+    simulations: Optional[int] = Query(
+        None,
+        description=(
+            "Number of simulations for a custom run (100–100000). "
+            "Omit to use the cached session result (consistent with all other endpoints)."
+        ),
+        ge=100,
+        le=100_000,
+    ),
+    seed: Optional[int] = Query(
+        None,
+        description="Random seed for a custom run (optional). Ignored when simulations is omitted.",
+    ),
 ):
     """Return a probabilistic forecast using Monte Carlo simulation.
 
-    This endpoint runs multiple simulations to generate a distribution of
-    possible finish dates, accounting for variability in velocity, remaining work,
-    blockers, and spillover.
+    Default behaviour (simulations omitted)
+    ----------------------------------------
+    Returns the same Monte Carlo result that was used to compute /forecast,
+    /risk, and /recommendations — i.e. the numbers are guaranteed consistent.
 
-    Key principle: Target end date is NEVER modified. It is a fixed business
+    Custom run (simulations provided)
+    -----------------------------------
+    Runs a fresh simulation with the requested count and optional seed.
+    Useful for what-if exploration; does NOT affect the session cache.
+
+    Key principle: Target end date is NEVER modified.  It is a fixed business
     commitment used only for probability calculation.
-
-    Args:
-        session_id: Session ID
-        simulations: Number of Monte Carlo simulations to run (100-100000, default 10000)
-        seed: Random seed for reproducibility (optional)
-
-    Returns:
-        MonteCarloResponse with:
-        - target_end_date: Fixed business commitment (constant)
-        - statistics: Percentile distribution of finish dates
-        - on_time_probability: Probability of finishing on or before target_end_date
-        - on_time_risk_level: Risk rating (LOW, MEDIUM, HIGH, CRITICAL)
-        - best_case/most_likely/worst_case: Summary scenarios
     """
     try:
-        project_state = store.get_project_state(session_id)
-        if not project_state:
-            raise HTTPException(
-                status_code=404,
-                detail=ApiResponse(
-                    success=False,
-                    error_code=ErrorCodes.SESSION_NOT_FOUND,
-                    message=f"Session {session_id} not found",
-                ).model_dump()
+        if simulations is None:
+            # ── Default: return the cached session result ──────────────────
+            analysis = store.get_analysis(session_id)
+            if not analysis:
+                raise HTTPException(
+                    status_code=404,
+                    detail=ApiResponse(
+                        success=False,
+                        error_code=ErrorCodes.SESSION_NOT_FOUND,
+                        message=f"Session {session_id} not found",
+                    ).model_dump(),
+                )
+
+            response = MonteCarloResponse(
+                session_id=session_id,
+                project_name=analysis.project_state.project_info.project_name,
+                monte_carlo=analysis.monte_carlo,
+            )
+            return ApiResponse(
+                success=True,
+                data=response.model_dump(),
+                message="Monte Carlo analysis (cached session result)",
             )
 
-        # Calculate metrics
-        metrics_engine = MetricsEngine(project_state)
-        metrics = metrics_engine.calculate()
+        else:
+            # ── Custom run: fresh simulation, does not update cache ────────
+            from app.engines.metrics_engine import MetricsEngine
+            from app.engines.dependency_engine import DependencyGraphEngine
+            from app.engines.critical_path_engine import CriticalPathEngine
+            from app.engines.spillover_engine import SpilloverAnalysisEngine
+            from app.engines.monte_carlo_engine import MonteCarloEngine
 
-        # Build dependency DAG and critical path
-        dep_engine = DependencyGraphEngine(project_state)
-        dag = dep_engine.build_dag()
-        cp_engine = CriticalPathEngine(project_state, dag)
-        cp_result = cp_engine.analyze()
+            project_state = store.get_project_state(session_id)
+            if not project_state:
+                raise HTTPException(
+                    status_code=404,
+                    detail=ApiResponse(
+                        success=False,
+                        error_code=ErrorCodes.SESSION_NOT_FOUND,
+                        message=f"Session {session_id} not found",
+                    ).model_dump(),
+                )
 
-        # Analyze spillover
-        spillover_engine = SpilloverAnalysisEngine(project_state, metrics.average_item_effort)
-        spillover = spillover_engine.analyze()
+            # Reuse cached upstream where possible to avoid redundant work.
+            analysis = store.get_analysis(session_id)
+            if analysis:
+                metrics = analysis.metrics
+                cp_result = analysis.cp_result
+                spillover = analysis.spillover
+            else:
+                metrics = MetricsEngine(project_state).calculate()
+                dag = DependencyGraphEngine(project_state).build_dag()
+                cp_result = CriticalPathEngine(project_state, dag).analyze()
+                spillover = SpilloverAnalysisEngine(
+                    project_state, metrics.average_item_effort
+                ).analyze()
 
-        # Monte Carlo simulation
-        mc_engine = MonteCarloEngine(
-            project_state=project_state,
-            metrics=metrics,
-            cp_result=cp_result,
-            spillover=spillover,
-            simulation_count=simulations,
-            seed=seed,
-        )
-        monte_carlo_result = mc_engine.calculate()
+            monte_carlo_result = MonteCarloEngine(
+                project_state=project_state,
+                metrics=metrics,
+                cp_result=cp_result,
+                spillover=spillover,
+                simulation_count=simulations,
+                seed=seed,
+            ).calculate()
 
-        response = MonteCarloResponse(
-            session_id=session_id,
-            project_name=project_state.project_info.project_name,
-            monte_carlo=monte_carlo_result,
-        )
-
-        return ApiResponse(
-            success=True,
-            data=response.model_dump(),
-            message=f"Monte Carlo analysis completed ({simulations} simulations)"
-        )
+            response = MonteCarloResponse(
+                session_id=session_id,
+                project_name=project_state.project_info.project_name,
+                monte_carlo=monte_carlo_result,
+            )
+            return ApiResponse(
+                success=True,
+                data=response.model_dump(),
+                message=f"Monte Carlo analysis ({simulations} simulations, custom run)",
+            )
 
     except HTTPException:
         raise
@@ -103,5 +137,5 @@ async def get_monte_carlo(
                 success=False,
                 error_code=ErrorCodes.PROCESSING_ERROR,
                 message=f"Error calculating Monte Carlo: {str(e)}",
-            ).model_dump()
+            ).model_dump(),
         )

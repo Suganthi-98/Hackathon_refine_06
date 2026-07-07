@@ -363,8 +363,17 @@ def _recommendation_to_summary(
 
 
 def _build_engine(session_id: str) -> RecommendationEngineV2:
-    project_state = store.get_project_state(session_id)
-    if not project_state:
+    """
+    Build a RecommendationEngineV2 pre-seeded with the session-level
+    ProjectAnalysis so _compute_upstream() returns immediately from cache
+    instead of re-running the full engine pipeline independently.
+
+    This ensures recommendations, forecast, risk, and Monte Carlo all read
+    from the same single computed truth for the session.
+    """
+    # Get cached analysis (builds it on first call for this session).
+    analysis = store.get_analysis(session_id)
+    if not analysis:
         raise HTTPException(
             status_code=404,
             detail=ApiResponse(
@@ -373,7 +382,16 @@ def _build_engine(session_id: str) -> RecommendationEngineV2:
                 message=f"Session {session_id} not found",
             ).model_dump(mode='json'),
         )
-    return RecommendationEngineV2(project_state=project_state, simulation_count=1000, scoring_weights=ScoringWeights())
+
+    engine = RecommendationEngineV2(
+        project_state=analysis.project_state,
+        simulation_count=1000,
+        scoring_weights=ScoringWeights(),
+    )
+    # Pre-seed the upstream cache so the engine never re-runs engines
+    # independently — it will use the shared session analysis instead.
+    engine._upstream = analysis.upstream
+    return engine
 
 
 _advisor_builder = AdvisorInputBuilder()
@@ -566,15 +584,16 @@ async def simulate_scenario(
             if rec.recommendation_id in set(request_body.recommendation_ids)
         ]
 
+        _up = recommendation_engine._compute_upstream()
         advisor_input = _advisor_builder.build_scenario_input(
             project_id=session_id,
             project_state=recommendation_engine.project_state,
-            forecast=recommendation_engine._compute_upstream().forecast,
-            monte_carlo=recommendation_engine._compute_upstream().monte_carlo,
+            forecast=_up.forecast,
+            monte_carlo=_up.monte_carlo,
             recommendations=recommendations,
             simulation_result=scenario,
-            risk=recommendation_engine._compute_upstream().risk_result,
-            metrics=recommendation_engine._compute_upstream().metrics,
+            risk=_up.risk_result,
+            metrics=_up.metrics,
         )
         advisor_explanation = await _get_narrative_service(request).explain(
             advisor_input,

@@ -100,9 +100,11 @@ class AISettings(BaseSettings):
     ai_advisor_enabled: bool = True
     ai_cache_enabled: bool = True
 
-    def __init__(self, _env_file: Optional[str] = None, **values):
-        # If an env file path was provided, parse it for legacy BOSCH_* keys
-        # and map them to the current AOAI_* field names before validation.
+    def __init__(self, _env_file=None, **values):
+        # If an env file path was explicitly provided, parse it and inject its
+        # values directly — bypassing system environment variable precedence.
+        # This ensures callers/tests that pass a custom .env file get exactly
+        # the values in that file, not whatever happens to be in the system env.
         if _env_file:
             try:
                 text = Path(_env_file).read_text()
@@ -110,6 +112,11 @@ class AISettings(BaseSettings):
                 text = None
 
             if text:
+                # Collect canonical (AOAI_*) and legacy (BOSCH_*) values
+                # separately so canonical names always win over legacy aliases.
+                canonical = {}
+                legacy = {}
+
                 for line in text.splitlines():
                     line = line.strip()
                     if not line or line.startswith("#"):
@@ -120,26 +127,76 @@ class AISettings(BaseSettings):
                     k = k.strip().upper()
                     v = v.strip()
 
-                    if k == "BOSCH_API_KEY":
-                        values.setdefault("aoai_farm_api_key", v)
-                    elif k == "BOSCH_ENDPOINT":
-                        values.setdefault("aoai_farm_domain", v)
-                    elif k == "BOSCH_DEPLOYMENT":
-                        values.setdefault("aoai_model", v)
-                    elif k == "BOSCH_API_VERSION":
-                        values.setdefault("aoai_api_version", v)
-                    elif k == "BOSCH_FARM_SUBSCRIPTION_ID":
-                        values.setdefault("aoai_farm_subscription_id", v)
-                    elif k == "AI_MODEL":
-                        values.setdefault("aoai_model", v)
-                    elif k == "PX_PROXY_URL":
-                        values.setdefault("px_proxy_url", v)
+                    # Canonical AOAI_* / AI_* names
+                    if k == "AOAI_FARM_API_KEY":
+                        canonical["aoai_farm_api_key"] = v
+                    elif k == "AOAI_FARM_DOMAIN":
+                        canonical["aoai_farm_domain"] = v
+                    elif k == "AOAI_MODEL":
+                        canonical["aoai_model"] = v
+                    elif k == "AOAI_API_VERSION":
+                        canonical["aoai_api_version"] = v
+                    elif k == "AOAI_FARM_SUBSCRIPTION_ID":
+                        canonical["aoai_farm_subscription_id"] = v
                     elif k == "AI_PROVIDER":
-                        values.setdefault("ai_provider", v)
+                        canonical["ai_provider"] = v
+                    elif k == "AI_MODEL":
+                        canonical.setdefault("aoai_model", v)
+                    elif k == "PX_PROXY_URL":
+                        canonical["px_proxy_url"] = v
+                    elif k == "AI_TEMPERATURE":
+                        canonical["ai_temperature"] = v
+                    elif k == "AI_TIMEOUT":
+                        canonical["ai_timeout"] = v
+                    elif k == "AI_MAX_TOKENS":
+                        canonical["ai_max_tokens"] = v
                     elif k == "AI_ADVISOR_ENABLED":
-                        values.setdefault("ai_advisor_enabled", v)
+                        canonical["ai_advisor_enabled"] = v
                     elif k == "AI_CACHE_ENABLED":
-                        values.setdefault("ai_cache_enabled", v)
+                        canonical["ai_cache_enabled"] = v
+                    # Legacy BOSCH_* names (only used when canonical is absent)
+                    elif k == "BOSCH_API_KEY":
+                        legacy["aoai_farm_api_key"] = v
+                    elif k == "BOSCH_ENDPOINT":
+                        legacy["aoai_farm_domain"] = v
+                    elif k == "BOSCH_DEPLOYMENT":
+                        legacy["aoai_model"] = v
+                    elif k == "BOSCH_API_VERSION":
+                        legacy["aoai_api_version"] = v
+                    elif k == "BOSCH_FARM_SUBSCRIPTION_ID":
+                        legacy["aoai_farm_subscription_id"] = v
+
+                # Priority: explicit kwargs > canonical file values > legacy file values.
+                merged = {**legacy, **canonical, **values}
+
+                # Temporarily unset system env vars for keys we are controlling,
+                # so pydantic-settings cannot let them override the file values.
+                _env_field_map = {
+                    "aoai_farm_api_key": ["AOAI_FARM_API_KEY", "BOSCH_API_KEY"],
+                    "aoai_farm_domain": ["AOAI_FARM_DOMAIN", "BOSCH_ENDPOINT"],
+                    "aoai_model": ["AOAI_MODEL", "BOSCH_DEPLOYMENT", "AI_MODEL"],
+                    "aoai_api_version": ["AOAI_API_VERSION", "BOSCH_API_VERSION"],
+                    "aoai_farm_subscription_id": ["AOAI_FARM_SUBSCRIPTION_ID", "BOSCH_FARM_SUBSCRIPTION_ID"],
+                    "ai_provider": ["AI_PROVIDER"],
+                    "px_proxy_url": ["PX_PROXY_URL"],
+                    "ai_temperature": ["AI_TEMPERATURE"],
+                    "ai_timeout": ["AI_TIMEOUT"],
+                    "ai_max_tokens": ["AI_MAX_TOKENS"],
+                    "ai_advisor_enabled": ["AI_ADVISOR_ENABLED"],
+                    "ai_cache_enabled": ["AI_CACHE_ENABLED"],
+                }
+                _saved_env = {}
+                for field, env_keys in _env_field_map.items():
+                    if field in merged:
+                        for env_key in env_keys:
+                            if env_key in os.environ:
+                                _saved_env[env_key] = os.environ.pop(env_key)
+
+                try:
+                    super().__init__(**merged)
+                finally:
+                    os.environ.update(_saved_env)
+                return
 
         super().__init__(**values)
 
