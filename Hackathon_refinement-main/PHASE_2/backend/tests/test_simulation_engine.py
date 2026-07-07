@@ -270,7 +270,12 @@ def test_simulation_engine_add_capacity(simulation_engine):
     assert result.days_recovered >= 0
 
 
-def test_simulation_engine_reassign_work_uses_last_affected_resource_as_receiver(simulation_engine):
+def test_simulation_engine_reassign_work_uses_explicit_target_resource_id(simulation_engine):
+    # NOTE: previously named "...uses_last_affected_resource_as_receiver" and asserted that
+    # behavior directly -- that was locking in a fragile, undocumented convention (guessing
+    # the receiver from list position) rather than testing real behavior. Every actual
+    # REASSIGN_ITEM candidate produced by candidate_generator.py sets an explicit
+    # target_resource_id in simulation_params; this test now matches that real contract.
     clone = simulation_engine.project_state.model_copy(deep=True)
     clone.team.append(
         Resource(
@@ -300,6 +305,7 @@ def test_simulation_engine_reassign_work_uses_last_affected_resource_as_receiver
         affected_sprint_ids=["S1"],
         affected_blocker_ids=[],
         root_cause_signal_id="SIG-002",
+        metadata={"simulation_params": {"target_resource_id": "R2"}},
     )
 
     simulation_engine.applicator.apply(clone, recommendation)

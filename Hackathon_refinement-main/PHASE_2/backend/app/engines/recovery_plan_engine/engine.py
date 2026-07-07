@@ -12,6 +12,7 @@ Returns complete ranked list of RecoveryPlan objects ready for API/frontend.
 """
 
 import logging
+from functools import cmp_to_key
 from typing import Any, Callable, Dict, List, Optional, Set
 
 from app.engines.recommendation_engine.models import Recommendation
@@ -106,21 +107,12 @@ class RecoveryPlanEngine:
         # Step 3: Score each plan
         plan_scores: List[RecoveryPlanScore] = self.scorer.score_all_plans(candidate_plans, scenario_results)
 
-        # Regression warning: AGGRESSIVE should normally aim to outperform SAFE.
-        safe_score = next(
-            (score for plan, score in zip(candidate_plans, plan_scores) if plan.archetype == RecoveryPlanArchetype.SAFE),
-            None,
-        )
-        aggressive_score = next(
-            (score for plan, score in zip(candidate_plans, plan_scores) if plan.archetype == RecoveryPlanArchetype.AGGRESSIVE),
-            None,
-        )
-        if safe_score and aggressive_score and aggressive_score.composite_score < safe_score.composite_score:
-            logger.warning(
-                "Aggressive recovery plan scored lower (%.3f) than Safe plan (%.3f); review plan archetype construction",
-                aggressive_score.composite_score,
-                safe_score.composite_score,
-            )
+        # NOTE: the old blanket "Aggressive scored lower than Safe" warning was removed
+        # from here -- it fired any time complexity flipped the ranking, even when that
+        # was legitimate (comparable outcomes, Safe genuinely simpler for similar results).
+        # The dominance-aware warning further below only fires when the reordering
+        # actually corrects a real contradiction (a plan dominated on every outcome
+        # metric still scoring higher due to complexity alone).
         
         # Step 4: Explain each plan
         plan_explanations = []
@@ -144,12 +136,53 @@ class RecoveryPlanEngine:
                 revised_plan = scenario.revised_sprint_plan
             revised_sprint_plans.append(revised_plan)
         
-        # Step 6: Rank by composite_score descending
+        # Step 6: Rank by composite_score descending, with a dominance safeguard.
+        #
+        # The complexity penalty exists to break ties between plans with similar
+        # outcomes (see plan_scorer.py docstring) -- it is NOT meant to override a
+        # plan that is strictly better on every real outcome metric. If plan A has
+        # probability >= plan B, delay <= plan B, and risk <= plan B (strictly better
+        # on at least one), A must never rank below B just because A has more
+        # actions. Complexity should only decide between genuinely comparable plans.
+        def _dominates(a: RecoveryPlanScore, b: RecoveryPlanScore) -> bool:
+            prob_ge = a.deadline_probability >= b.deadline_probability
+            delay_le = a.expected_delay_days <= b.expected_delay_days
+            risk_le = a.overall_risk_score <= b.overall_risk_score
+            strictly_better = (
+                a.deadline_probability > b.deadline_probability
+                or a.expected_delay_days < b.expected_delay_days
+                or a.overall_risk_score < b.overall_risk_score
+            )
+            return prob_ge and delay_le and risk_le and strictly_better
+
+        def _compare(i: int, j: int) -> int:
+            if _dominates(plan_scores[i], plan_scores[j]):
+                return -1  # i ranks above j regardless of composite_score
+            if _dominates(plan_scores[j], plan_scores[i]):
+                return 1
+            # No dominance either way -- fall back to composite_score, which is
+            # exactly where the complexity penalty is meant to act as a tie-breaker.
+            if plan_scores[i].composite_score > plan_scores[j].composite_score:
+                return -1
+            if plan_scores[i].composite_score < plan_scores[j].composite_score:
+                return 1
+            return 0
+
         ranked_indices = sorted(
             range(len(plan_scores)),
-            key=lambda i: plan_scores[i].composite_score,
-            reverse=True,
+            key=cmp_to_key(_compare),
         )
+        # If dominance reordering actually changed anything vs. plain composite-score
+        # sort, log it -- this is different from (and replaces) the old blanket
+        # "Aggressive < Safe" warning, which fired even when no real contradiction existed.
+        composite_only_order = sorted(range(len(plan_scores)), key=lambda i: plan_scores[i].composite_score, reverse=True)
+        if ranked_indices != composite_only_order:
+            logger.warning(
+                "Recovery plan ranking overridden by dominance safeguard: composite-score order %s changed to %s "
+                "because a plan with more actions was strictly better on every outcome metric.",
+                [candidate_plans[i].archetype.value for i in composite_only_order],
+                [candidate_plans[i].archetype.value for i in ranked_indices],
+            )
         
         # Step 7: Build final RecoveryPlan objects (now marked as Recommended/Alternative)
         final_plans: List[RecoveryPlan] = []
