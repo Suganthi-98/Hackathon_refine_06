@@ -419,3 +419,196 @@ class AdvisorInputBuilder:
             recommendations=recommendation_facts,
             scenario=scenario_facts,
         )
+
+
+# ---------------------------------------------------------------------------
+# Recovery plan projection helpers
+# (imported here to keep the builder as the single assembly point)
+# ---------------------------------------------------------------------------
+
+from app.engines.advisor_contract import RecoveryPlanArchetypeFacts  # noqa: E402
+
+
+def build_recovery_plan_facts(recovery_plan: Any) -> "RecoveryPlanArchetypeFacts":
+    """
+    Project a RecoveryPlan (scored + ranked) -> RecoveryPlanArchetypeFacts.
+
+    `rank` is assigned by the caller (position in the already-sorted list),
+    not derived here — the engine has already ranked by composite_score.
+    """
+    from app.engines.advisor_contract import RecoveryPlanArchetypeFacts as _Facts
+    return _Facts(
+        plan_id=recovery_plan.plan_id,
+        archetype=recovery_plan.archetype.value,
+        label=recovery_plan.label,
+        rank=0,  # overridden by build_recovery_plan_input below
+        deadline_probability=recovery_plan.score.deadline_probability,
+        expected_delay_days=recovery_plan.score.expected_delay_days,
+        overall_risk_score=recovery_plan.score.overall_risk_score,
+        composite_score=recovery_plan.score.composite_score,
+        execution_complexity=recovery_plan.score.execution_complexity,
+        actions_count=len(recovery_plan.actions),
+        why_recommended=list(recovery_plan.explanation.why_recommended),
+        comparison_to_alternatives=list(recovery_plan.explanation.comparison_to_alternatives),
+        narrative_summary=recovery_plan.explanation.narrative_summary,
+        trade_off_descriptions=[t.description for t in recovery_plan.explanation.trade_offs],
+    )
+
+
+class AdvisorInputBuilder:  # type: ignore[no-redef]  # intentional redefinition with recovery support
+    """
+    Extended AdvisorInputBuilder — adds build_recovery_plan_input().
+
+    All existing methods (build_recommendation_input, build_simulation_input,
+    build_scenario_input) are preserved unchanged.
+    """
+
+    def build_recommendation_input(
+        self,
+        project_id: str,
+        project_state: "ProjectState",
+        forecast: "ForecastResult",
+        monte_carlo: "MonteCarloResult",
+        recommendations: "List[Recommendation]",
+        metrics: "Optional[ProjectMetrics]" = None,
+    ) -> "AdvisorInput":
+        """Project context + ranked recommendations — no scenario/simulation data."""
+        return self._build(
+            project_id=project_id,
+            project_state=project_state,
+            forecast=forecast,
+            monte_carlo=monte_carlo,
+            metrics=metrics,
+            recommendations=recommendations,
+        )
+
+    def build_simulation_input(
+        self,
+        project_id: str,
+        recommendation: "Recommendation",
+        simulation_result: "RecommendationSimulationResult",
+        risk: "Optional[RiskResult]" = None,
+        project_state: "Optional[ProjectState]" = None,
+        forecast: "Optional[ForecastResult]" = None,
+        monte_carlo: "Optional[MonteCarloResult]" = None,
+        metrics: "Optional[ProjectMetrics]" = None,
+    ) -> "AdvisorInput":
+        """Single recommendation + simulation result."""
+        return self._build(
+            project_id=project_id,
+            project_state=project_state,
+            forecast=forecast,
+            monte_carlo=monte_carlo,
+            metrics=metrics,
+            risk=risk,
+            recommendations=[recommendation],
+            simulation_result=simulation_result,
+        )
+
+    def build_scenario_input(
+        self,
+        project_id: str,
+        project_state: "ProjectState",
+        forecast: "ForecastResult",
+        monte_carlo: "MonteCarloResult",
+        recommendations: "List[Recommendation]",
+        simulation_result: "RecommendationSimulationResult",
+        risk: "Optional[RiskResult]" = None,
+        metrics: "Optional[ProjectMetrics]" = None,
+    ) -> "AdvisorInput":
+        """Multi-recommendation scenario explanations."""
+        return self._build(
+            project_id=project_id,
+            project_state=project_state,
+            forecast=forecast,
+            monte_carlo=monte_carlo,
+            metrics=metrics,
+            risk=risk,
+            recommendations=recommendations,
+            simulation_result=simulation_result,
+        )
+
+    def build_recovery_plan_input(
+        self,
+        project_id: str,
+        project_state: "ProjectState",
+        forecast: "ForecastResult",
+        monte_carlo: "MonteCarloResult",
+        recommendations: "List[Recommendation]",
+        recovery_plans: list,
+        metrics: "Optional[ProjectMetrics]" = None,
+    ) -> "AdvisorInput":
+        """
+        Project context + ranked recovery plans — for the Recovery Advisor narrative.
+
+        recovery_plans must be the already-ranked list from
+        RecoveryPlanEngine.generate_recovery_plans() (sorted by composite_score desc).
+        Rank is assigned by position in the list (0-indexed → rank 1, 2, 3).
+        """
+        from app.engines.advisor_contract import RecoveryPlanArchetypeFacts as _Facts, AdvisorInput as _AI
+
+        project_context = None
+        if project_state is not None and forecast is not None and monte_carlo is not None:
+            project_context = build_project_context(project_state, forecast, monte_carlo)
+
+        metrics_facts = build_metrics_facts(metrics) if metrics is not None else None
+
+        recommendation_facts = [build_recommendation_facts(rec) for rec in (recommendations or [])]
+
+        # Assign rank by position in the already-sorted list
+        recovery_plan_facts = []
+        for i, plan in enumerate(recovery_plans or []):
+            facts = build_recovery_plan_facts(plan)
+            # rank is frozen on the dataclass — rebuild with correct rank
+            recovery_plan_facts.append(
+                _Facts(**{**facts.model_dump(), "rank": i + 1})
+            )
+
+        return _AI(
+            project_id=project_id,
+            project_context=project_context,
+            metrics=metrics_facts,
+            recommendations=recommendation_facts,
+            recovery_plans=recovery_plan_facts,
+        )
+
+    def _build(
+        self,
+        project_id: str,
+        project_state: "Optional[ProjectState]" = None,
+        forecast: "Optional[ForecastResult]" = None,
+        monte_carlo: "Optional[MonteCarloResult]" = None,
+        metrics: "Optional[ProjectMetrics]" = None,
+        risk: "Optional[RiskResult]" = None,
+        recommendations: "Optional[List[Recommendation]]" = None,
+        simulation_result: "Optional[RecommendationSimulationResult]" = None,
+    ) -> "AdvisorInput":
+        """Shared assembly logic for non-recovery paths."""
+        from app.engines.advisor_contract import AdvisorInput as _AI
+
+        project_context = None
+        if project_state is not None and forecast is not None and monte_carlo is not None:
+            project_context = build_project_context(project_state, forecast, monte_carlo)
+
+        metrics_facts = build_metrics_facts(metrics) if metrics is not None else None
+
+        recommendation_facts = [
+            build_recommendation_facts(rec) for rec in (recommendations or [])
+        ]
+
+        scenario_facts = None
+        if simulation_result is not None:
+            scenario_facts = build_scenario_facts(
+                simulation_result,
+                forecast=forecast,
+                monte_carlo=monte_carlo,
+                risk_result=risk,
+            )
+
+        return _AI(
+            project_id=project_id,
+            project_context=project_context,
+            metrics=metrics_facts,
+            recommendations=recommendation_facts,
+            scenario=scenario_facts,
+        )

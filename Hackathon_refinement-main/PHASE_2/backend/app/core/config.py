@@ -4,8 +4,9 @@ All simulation parameters and constants in one place.
 Never hardcode configuration values inline.
 """
 
-from pydantic_settings import BaseSettings
 from typing import Dict
+
+from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
@@ -73,9 +74,11 @@ class Settings(BaseSettings):
     demo_workbook_path: str = "PHASE_2/INPUT/TIO2_Sprint_Intelligence_v5_final.xlsx"
     frontend_origin: str | None = None
 
-    class Config:
-        env_file = ".env"
-        case_sensitive = False
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        case_sensitive=False,
+        extra="ignore",
+    )
 
 
 # Global settings instance

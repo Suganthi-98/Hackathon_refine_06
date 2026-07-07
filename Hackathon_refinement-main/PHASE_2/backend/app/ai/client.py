@@ -15,8 +15,10 @@ BoschClient
 
     Authentication:  genaiplatform-farm-subscription-key header
                      (NOT Authorization: Bearer)
-    Endpoint:        https://aoai-farm.bosch-temp.com/api/openai/deployments/
-                     {deployment}/chat/completions?api-version={version}
+    Endpoint:        {AOAI_FARM_DOMAIN}/api/openai/deployments/
+                     {AOAI_MODEL}/chat/completions?api-version={AOAI_API_VERSION}
+    Proxy:           PX_PROXY_URL — forwarded to httpx as proxies={"all": url}
+                     Required on Bosch networks that route egress through 127.0.0.1:3128
     Response format: standard OpenAI chat completion JSON
     Structured output: JSON mode — model is instructed to return strict JSON;
                         no tool-calling required.
@@ -59,7 +61,6 @@ from app.ai.prompts import (
     ADVISOR_SYSTEM_PROMPT,
     ADVISOR_OUTPUT_TOOL,
     BOSCH_SYSTEM_PROMPT,
-    BOSCH_JSON_SCHEMA_INSTRUCTION,
 )
 
 logger = logging.getLogger(__name__)
@@ -78,32 +79,51 @@ class BoschClient:
     """
     Async HTTP client for the Bosch LLM Farm (OpenAI-compatible endpoint).
 
-    The Bosch Farm does not support Anthropic-style tool-calling.
+    Credential mapping from Bosch environment variables:
+        AOAI_FARM_API_KEY          → genaiplatform-farm-subscription-key header
+        AOAI_FARM_DOMAIN           → base URL
+        AOAI_MODEL                 → deployment path segment
+        AOAI_API_VERSION           → ?api-version= query param
+        AOAI_FARM_SUBSCRIPTION_ID  → subscription routing header (if set)
+        PX_PROXY_URL               → httpx proxy (e.g. http://127.0.0.1:3128)
+
     Structured output is achieved by:
       1. Including the AdvisorOutput JSON schema in the system prompt
          (see app/ai/prompts.py: BOSCH_JSON_SCHEMA_INSTRUCTION)
       2. Instructing the model to return ONLY valid JSON, no markdown fences
       3. Parsing the response with json.loads() and validating with Pydantic
-
-    This is identical to what NarrativeService already does with the
-    Anthropic client — the only difference is how the model is told to
-    structure its output.
     """
 
     def __init__(self, settings: AISettings) -> None:
-        if not settings.bosch_api_key:
+        if not settings.aoai_farm_api_key:
             raise AIClientError(
-                "BOSCH_API_KEY is not set.  Add it to your .env file."
+                "AOAI_FARM_API_KEY is not set.  Add it to your .env file.\n"
+                "  AOAI_FARM_API_KEY=<your key from Bosch credentials>"
             )
         self._settings = settings
+
+        headers: Dict[str, str] = {
+            "Content-Type": "application/json",
+            # Bosch LLM Farm uses this header for auth — NOT Authorization: Bearer
+            "genaiplatform-farm-subscription-key": settings.aoai_farm_api_key,
+        }
+        # Optional subscription routing header — present when AOAI_FARM_SUBSCRIPTION_ID is set
+        if settings.aoai_farm_subscription_id:
+            headers["subscription-id"] = settings.aoai_farm_subscription_id
+
+        # Build httpx client — wire proxy when PX_PROXY_URL is configured
+        client_kwargs: Dict[str, Any] = {
+            "timeout": httpx.Timeout(settings.ai_timeout),
+            "headers": headers,
+        }
+        if settings.px_proxy_url:
+            client_kwargs["proxies"] = {"all://": settings.px_proxy_url}
+            logger.info(
+                "BoschClient: routing traffic through proxy %s", settings.px_proxy_url
+            )
+
         # One shared connection pool for the application lifetime.
-        self._http = httpx.AsyncClient(
-            timeout=httpx.Timeout(settings.ai_timeout),
-            headers={
-                "Content-Type": "application/json",
-                "genaiplatform-farm-subscription-key": settings.bosch_api_key,
-            },
-        )
+        self._http = httpx.AsyncClient(**client_kwargs)
 
     async def generate(self, user_message: str) -> Dict[str, Any]:
         """
@@ -220,10 +240,8 @@ class BoschClient:
         if the model adds them anyway (some model versions do despite the
         instruction).
         """
-        # Strip optional ```json ... ``` wrapper
         text = raw_text
         if text.startswith("```"):
-            # Remove opening fence (```json or ```)
             text = text[text.index("\n") + 1:] if "\n" in text else text[3:]
         if text.endswith("```"):
             text = text[: text.rfind("```")]
@@ -336,7 +354,7 @@ class ClaudeClient:
 
     async def _create_message(self, user_message: str) -> Dict[str, Any]:
         response = await self._client.messages.create(
-            model=self._settings.ai_model,
+            model="claude-sonnet-4-6",
             max_tokens=self._settings.ai_max_tokens,
             system=ADVISOR_SYSTEM_PROMPT,
             tools=[ADVISOR_OUTPUT_TOOL],

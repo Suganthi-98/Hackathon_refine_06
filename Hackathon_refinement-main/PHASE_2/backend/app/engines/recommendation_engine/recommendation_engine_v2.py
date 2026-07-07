@@ -37,6 +37,8 @@ from app.engines.recommendation_engine.signal_detectors import (
     SpilloverRootCauseDetector,
     SprintDetector,
     SwarmTradeoffDetector,
+    SkillMismatchDetector,
+    LowVelocityDetector,
 )
 from app.engines.simulation_engine import EngineRunner, SimulationEngineV2
 
@@ -86,6 +88,8 @@ class RecommendationEngineV2:
         signals.extend(RampUpDetector(self.project_state).detect())
         signals.extend(ResequencingDetector(self.project_state, upstream.dag, upstream.cp_result).detect())
         signals.extend(SwarmTradeoffDetector(self.project_state, upstream.cp_result).detect())
+        signals.extend(SkillMismatchDetector(self.project_state).detect())
+        signals.extend(LowVelocityDetector(self.project_state).detect())
 
         signals.extend(self._fallback_signals(signals))
 

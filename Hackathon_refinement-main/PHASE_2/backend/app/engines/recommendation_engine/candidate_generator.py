@@ -137,6 +137,50 @@ class CandidateGenerator:
         is_cp_owner = bool(signal.context.get("is_single_owner_of_cp", False)) if signal.context else False
         load_ratio = float(signal.context.get("load_ratio", 0.0)) if signal.context else 0.0
 
+        if flag == "SKILL_MISMATCH":
+            current_owner_id = signal.context.get("current_owner_id", resource_id)
+            better_resource_id = signal.context.get("better_resource_id")
+            required_skill = signal.context.get("required_skill")
+            candidates.append(self._build_candidate(
+                action_type=RecommendationAction.REASSIGN_ITEM,
+                title=f"Reassign due to skill mismatch ({item_id})",
+                description=(
+                    f"{current_owner_id} lacks '{required_skill}' as a primary or secondary skill for {item_id}; "
+                    f"{better_resource_id} has it as a primary skill with "
+                    f"{signal.context.get('better_resource_availability_pct', 0.0):.0%} availability."
+                ),
+                affected_item_ids=[item_id],
+                affected_resource_ids=[current_owner_id, better_resource_id] if better_resource_id else [current_owner_id],
+                affected_sprint_ids=signal.affected_sprint_ids,
+                affected_blocker_ids=signal.affected_blocker_ids,
+                root_signal_id=signal.signal_id,
+                simulation_params={"target_resource_id": better_resource_id, "target_item_id": item_id, "reason": "skill_mismatch"},
+                feasibility_checks={"resource_exists": True, "skill_match_confirmed": True},
+            ))
+            return candidates
+
+        if flag == "LOW_VELOCITY":
+            current_owner_id = signal.context.get("current_owner_id", resource_id)
+            better_resource_id = signal.context.get("better_resource_id")
+            candidates.append(self._build_candidate(
+                action_type=RecommendationAction.REASSIGN_ITEM,
+                title=f"Reassign due to low relative velocity ({item_id})",
+                description=(
+                    f"{current_owner_id} completes ~{signal.context.get('current_owner_velocity', 0.0)}hrs/sprint "
+                    f"(n={signal.context.get('current_owner_sample_size', 0)} completed items) on this skill, vs "
+                    f"{better_resource_id}'s ~{signal.context.get('better_resource_velocity', 0.0)}hrs/sprint "
+                    f"(n={signal.context.get('better_resource_sample_size', 0)}). Both have the required skill."
+                ),
+                affected_item_ids=[item_id],
+                affected_resource_ids=[current_owner_id, better_resource_id] if better_resource_id else [current_owner_id],
+                affected_sprint_ids=signal.affected_sprint_ids,
+                affected_blocker_ids=signal.affected_blocker_ids,
+                root_signal_id=signal.signal_id,
+                simulation_params={"target_resource_id": better_resource_id, "target_item_id": item_id, "reason": "low_velocity"},
+                feasibility_checks={"resource_exists": True, "velocity_sample_sufficient": True},
+            ))
+            return candidates
+
         if flag == "UNDERUTILIZED":
             candidates.append(self._build_candidate(
                 action_type=RecommendationAction.REBALANCE_SPRINT_LOAD,
@@ -199,17 +243,49 @@ class CandidateGenerator:
             return candidates
 
         if flag == "OVERLOADED":
+            # Find a real receiver instead of self-targeting the overloaded resource --
+            # this was the original "Reassign work" gap flagged from the start: no
+            # candidate-resource search existed at all. Score by skill match + availability,
+            # same approach used by SkillMismatchDetector, since we don't have a
+            # per-resource confidence-weighted velocity signal reliably available for
+            # every overloaded case (LowVelocityDetector handles that distinctly).
+            item = next((wi for wi in self.project_state.work_items if wi.item_id == item_id), None) if item_id else None
+            required_skill = getattr(item, "required_skill", None) if item else None
+            better = None
+            if required_skill:
+                candidates_pool = [
+                    r for r in self.project_state.team
+                    if r.resource_id != resource_id
+                    and required_skill in {r.primary_skill, r.secondary_skill}
+                    and float(getattr(r, "availability_pct", 0.0) or 0.0) > 0.1
+                ]
+                if candidates_pool:
+                    better = max(
+                        candidates_pool,
+                        key=lambda r: (
+                            r.primary_skill == required_skill,
+                            float(getattr(r, "availability_pct", 0.0) or 0.0) * (1 - float(getattr(r, "allocation_pct", 0.0) or 0.0)),
+                        ),
+                    )
+            if better is None:
+                # No genuine receiver found -- do not emit a self-targeting candidate that
+                # would silently no-op when simulated. Reject rather than fake a reassignment.
+                return candidates
             candidates.append(self._build_candidate(
                 action_type=RecommendationAction.REASSIGN_ITEM,
                 title=f"Reassign item ({item_id or resource_id})",
-                description=f"Reassign work to ease overloaded resource {resource_id}",
+                description=(
+                    f"Move {item_id} from overloaded {resource_id} (load ratio {load_ratio:.2f}) to "
+                    f"{better.resource_id}, who has the required skill and "
+                    f"{float(getattr(better, 'availability_pct', 0.0) or 0.0):.0%} availability."
+                ),
                 affected_item_ids=signal.affected_item_ids,
-                affected_resource_ids=[resource_id],
+                affected_resource_ids=[resource_id, better.resource_id],
                 affected_sprint_ids=signal.affected_sprint_ids,
                 affected_blocker_ids=signal.affected_blocker_ids,
                 root_signal_id=signal.signal_id,
-                simulation_params={"target_resource_id": resource_id, "target_item_id": item_id},
-                feasibility_checks={"resource_exists": True, "has_capacity": True},
+                simulation_params={"target_resource_id": better.resource_id, "target_item_id": item_id},
+                feasibility_checks={"resource_exists": True, "has_capacity": True, "receiver_identified": True},
             ))
             return candidates
 

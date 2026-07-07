@@ -483,6 +483,182 @@ class SpilloverRootCauseDetector:
         return "toolchain_friction"
 
 
+class SkillMismatchDetector:
+    """Flags work items where the assigned resource's skills don't match the
+    item's required_skill at all (neither primary nor secondary), while a
+    better-matched resource with real availability exists on the team.
+    Distinct from CapacityDetector's OVERLOADED reason -- this fires purely
+    on skill fit, independent of whether the current owner is overloaded."""
+
+    def __init__(self, project_state: ProjectState) -> None:
+        self.project_state = project_state
+
+    def detect(self) -> List[OpportunitySignal]:
+        signals: List[OpportunitySignal] = []
+        team_by_id = {r.resource_id: r for r in self.project_state.team}
+        team_by_name = {r.name: r for r in self.project_state.team}
+
+        for wi in self.project_state.work_items:
+            if wi.status not in {WorkItemStatus.NOT_STARTED, WorkItemStatus.IN_PROGRESS}:
+                continue
+            required_skill = getattr(wi, "required_skill", None)
+            owner_ref = getattr(wi, "assigned_resource", None)
+            if not required_skill or not owner_ref:
+                continue
+            owner = team_by_id.get(owner_ref) or team_by_name.get(owner_ref)
+            if owner is None:
+                continue
+            if required_skill in {owner.primary_skill, owner.secondary_skill}:
+                continue  # owner has at least a secondary-level match -- not a mismatch
+
+            candidates = [
+                r for r in self.project_state.team
+                if r.resource_id != owner.resource_id
+                and required_skill in {r.primary_skill, r.secondary_skill}
+                and float(getattr(r, "availability_pct", 0.0) or 0.0) > 0.1
+            ]
+            if not candidates:
+                continue
+            # prefer a primary-skill match over a secondary one if both exist, then by availability
+            better = max(
+                candidates,
+                key=lambda r: (r.primary_skill == required_skill, float(getattr(r, "availability_pct", 0.0) or 0.0)),
+            )
+
+            context = {
+                "flag": "SKILL_MISMATCH",
+                "current_owner_id": owner.resource_id,
+                "current_owner_primary_skill": owner.primary_skill,
+                "current_owner_secondary_skill": owner.secondary_skill,
+                "better_resource_id": better.resource_id,
+                "better_resource_primary_skill": better.primary_skill,
+                "better_resource_availability_pct": float(getattr(better, "availability_pct", 0.0) or 0.0),
+                "required_skill": required_skill,
+            }
+            evidence = [
+                SignalEvidence(
+                    source_engine="signal_detectors",
+                    metric_name="skill_match",
+                    metric_value=0.0,
+                    threshold=1.0,
+                    explanation=f"{owner.resource_id} has neither primary nor secondary skill '{required_skill}' required by {wi.item_id}",
+                )
+            ]
+            signals.append(OpportunitySignal(
+                signal_id=signal_id(SignalCategory.CAPACITY, [wi.item_id, "skill_mismatch"]),
+                category=SignalCategory.CAPACITY,
+                severity=SignalSeverity.MEDIUM,
+                affected_item_ids=[wi.item_id],
+                affected_resource_ids=[owner.resource_id, better.resource_id],
+                affected_sprint_ids=[wi.assigned_sprint] if getattr(wi, "assigned_sprint", None) else [],
+                affected_blocker_ids=[],
+                evidence=evidence,
+                context=context,
+                detected_at=datetime.now(timezone.utc).isoformat(),
+            ))
+        return signals[:8]
+
+
+class LowVelocityDetector:
+    """Flags work items whose assigned resource has a correctly-matched skill
+    but a meaningfully lower historical completion velocity than another
+    available, equally-skilled teammate. Velocity is derived (not stored)
+    from completed work items, and requires at least 3 completed items
+    before a resource's velocity is trusted -- thin-sample resources are
+    never used as the 'better' comparison target, to avoid flagging a
+    reassignment based on a lucky handful of fast completions."""
+
+    MIN_SAMPLE_SIZE = 3
+    MIN_RELATIVE_IMPROVEMENT = 0.3  # only flag if candidate is >=30% faster
+
+    def __init__(self, project_state: ProjectState) -> None:
+        self.project_state = project_state
+
+    def _resource_velocity(self, resource_id: str, resource_name: str) -> tuple[float, int]:
+        completed = [
+            wi for wi in self.project_state.work_items
+            if wi.status == WorkItemStatus.COMPLETED
+            and getattr(wi, "assigned_resource", None) in {resource_id, resource_name}
+        ]
+        if not completed:
+            return 0.0, 0
+        distinct_sprints = {wi.assigned_sprint for wi in completed if getattr(wi, "assigned_sprint", None)}
+        sprint_count = max(1, len(distinct_sprints))
+        total_hours = sum(float(getattr(wi, "estimated_effort_hrs", 0.0) or 0.0) for wi in completed)
+        return total_hours / sprint_count, len(completed)
+
+    def detect(self) -> List[OpportunitySignal]:
+        signals: List[OpportunitySignal] = []
+        velocities = {r.resource_id: self._resource_velocity(r.resource_id, r.name) for r in self.project_state.team}
+        team_by_id = {r.resource_id: r for r in self.project_state.team}
+        team_by_name = {r.name: r for r in self.project_state.team}
+
+        for wi in self.project_state.work_items:
+            if wi.status not in {WorkItemStatus.NOT_STARTED, WorkItemStatus.IN_PROGRESS}:
+                continue
+            required_skill = getattr(wi, "required_skill", None)
+            owner_ref = getattr(wi, "assigned_resource", None)
+            if not required_skill or not owner_ref:
+                continue
+            owner = team_by_id.get(owner_ref) or team_by_name.get(owner_ref)
+            if owner is None or required_skill not in {owner.primary_skill, owner.secondary_skill}:
+                continue  # skill mismatch is SkillMismatchDetector's job, not this one
+
+            owner_velocity, owner_samples = velocities.get(owner.resource_id, (0.0, 0))
+            if owner_samples < self.MIN_SAMPLE_SIZE:
+                continue  # not enough history to say the owner is genuinely slow
+
+            candidates = []
+            for r in self.project_state.team:
+                if r.resource_id == owner.resource_id:
+                    continue
+                if required_skill not in {r.primary_skill, r.secondary_skill}:
+                    continue
+                if float(getattr(r, "availability_pct", 0.0) or 0.0) <= 0.1:
+                    continue
+                cand_velocity, cand_samples = velocities.get(r.resource_id, (0.0, 0))
+                if cand_samples < self.MIN_SAMPLE_SIZE:
+                    continue
+                if owner_velocity <= 0 or (cand_velocity - owner_velocity) / owner_velocity < self.MIN_RELATIVE_IMPROVEMENT:
+                    continue
+                candidates.append((r, cand_velocity, cand_samples))
+            if not candidates:
+                continue
+            better, better_velocity, better_samples = max(candidates, key=lambda c: c[1])
+
+            context = {
+                "flag": "LOW_VELOCITY",
+                "current_owner_id": owner.resource_id,
+                "current_owner_velocity": round(owner_velocity, 2),
+                "current_owner_sample_size": owner_samples,
+                "better_resource_id": better.resource_id,
+                "better_resource_velocity": round(better_velocity, 2),
+                "better_resource_sample_size": better_samples,
+            }
+            evidence = [
+                SignalEvidence(
+                    source_engine="signal_detectors",
+                    metric_name="resource_velocity",
+                    metric_value=round(owner_velocity, 2),
+                    threshold=round(better_velocity, 2),
+                    explanation=f"{owner.resource_id} completes ~{round(owner_velocity,1)}hrs/sprint (n={owner_samples}) vs {better.resource_id}'s ~{round(better_velocity,1)}hrs/sprint (n={better_samples})",
+                )
+            ]
+            signals.append(OpportunitySignal(
+                signal_id=signal_id(SignalCategory.CAPACITY, [wi.item_id, "low_velocity"]),
+                category=SignalCategory.CAPACITY,
+                severity=SignalSeverity.MEDIUM,
+                affected_item_ids=[wi.item_id],
+                affected_resource_ids=[owner.resource_id, better.resource_id],
+                affected_sprint_ids=[wi.assigned_sprint] if getattr(wi, "assigned_sprint", None) else [],
+                affected_blocker_ids=[],
+                evidence=evidence,
+                context=context,
+                detected_at=datetime.now(timezone.utc).isoformat(),
+            ))
+        return signals[:8]
+
+
 class SPOFDetector:
     def __init__(self, project_state: ProjectState, cp_result: Optional[CriticalPathResult] = None) -> None:
         self.project_state = project_state

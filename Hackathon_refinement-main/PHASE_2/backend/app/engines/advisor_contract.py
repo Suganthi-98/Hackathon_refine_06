@@ -546,3 +546,97 @@ def render_executive_summary(
     """Renders the single project-level headline shown before recommendations."""
     text, ok = render_section(summary.headline, source)
     return {"headline": text, "fully_resolved": ok}
+
+
+# ---------------------------------------------------------------------------
+# 4. RECOVERY PLAN FACTS — projection of RecoveryPlan scored output
+# ---------------------------------------------------------------------------
+# Added to support the Recovery Advisor narrative (NarrativeService.explain_recovery_plans).
+# Each entry is one ranked plan; the AI uses this to compare archetypes and explain
+# why the recommended strategy fits this project's specific failure mode.
+
+
+class RecoveryPlanArchetypeFacts(BaseModel):
+    """
+    Projection of a single RecoveryPlan (scored + explained output).
+
+    Contains only the fields the AI is allowed to reference — no engine
+    objects, no Recommendation internals. The AI uses these to compare
+    archetypes and write a recovery narrative.
+
+    Field provenance (real upstream models):
+      - plan_id / archetype / label      <- RecoveryPlan
+      - rank                             <- position in sorted recovery_plans list
+      - deadline_probability             <- RecoveryPlanScore.deadline_probability
+      - expected_delay_days              <- RecoveryPlanScore.expected_delay_days
+      - overall_risk_score               <- RecoveryPlanScore.overall_risk_score
+      - composite_score                  <- RecoveryPlanScore.composite_score
+      - execution_complexity             <- RecoveryPlanScore.execution_complexity
+      - actions_count                    <- len(RecoveryPlan.actions)
+      - why_recommended                  <- RecoveryPlanExplanation.why_recommended
+      - comparison_to_alternatives       <- RecoveryPlanExplanation.comparison_to_alternatives
+      - narrative_summary                <- RecoveryPlanExplanation.narrative_summary
+      - trade_off_descriptions           <- [t.description for t in explanation.trade_offs]
+    """
+
+    plan_id: str
+    archetype: str           # "SAFE", "AGGRESSIVE", "MINIMAL_DISRUPTION"
+    label: str               # "Recommended", "Alternative", "Alternative 2"
+    rank: int                # 1 = highest composite_score
+    deadline_probability: float
+    expected_delay_days: float
+    overall_risk_score: float
+    composite_score: float
+    execution_complexity: str   # "Low", "Medium", "High"
+    actions_count: int
+    why_recommended: List[str]
+    comparison_to_alternatives: List[str]
+    narrative_summary: str
+    trade_off_descriptions: List[str] = Field(default_factory=list)
+
+    model_config = {"frozen": True}
+
+
+# ---------------------------------------------------------------------------
+# Extend AdvisorInput with recovery_plans field
+# ---------------------------------------------------------------------------
+# Pydantic v2 does not support adding fields to a frozen model after the fact,
+# so we rebuild AdvisorInput here with the new field appended.
+# Existing code that constructs AdvisorInput without recovery_plans is
+# unaffected — the field defaults to an empty list.
+
+class AdvisorInput(BaseModel):  # type: ignore[no-redef]  # intentional redefinition
+    """
+    The complete, closed universe of facts the advisor may reference.
+
+    Extended with recovery_plans to support the Recovery Advisor narrative.
+    All other fields and behaviour are identical to the original definition.
+    """
+
+    project_id: str
+    project_context: Optional[ProjectContextFacts] = None
+    metrics: Optional[MetricsFacts] = None
+    recommendations: List[RecommendationFacts] = Field(default_factory=list)
+    scenario: Optional[ScenarioFacts] = None
+    recovery_plans: List[RecoveryPlanArchetypeFacts] = Field(default_factory=list)
+
+    model_config = {"frozen": True}
+
+    def get_path(self, path: str) -> Any:
+        """
+        Resolve a dotted field path against this snapshot, e.g.:
+            "scenario.days_saved"
+            "recommendations[0].estimated_delay_reduction_days"
+            "recovery_plans[0].deadline_probability"
+
+        Used by the renderer to verify/resolve a ClaimRef. Raises
+        KeyError/IndexError/AttributeError on any invalid path --
+        callers MUST catch and treat as "claim invalid, drop it."
+        """
+        obj: Any = self
+        for part in _tokenize_path(path):
+            if isinstance(part, int):
+                obj = obj[part]
+            else:
+                obj = getattr(obj, part)
+        return obj

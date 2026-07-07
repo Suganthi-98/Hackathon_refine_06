@@ -455,7 +455,18 @@ class SimulationEngine:
         self.risk_result = risk_result
         self.simulation_count = simulation_count
         self.seed = seed
-        self.applicator = _ActiveActionApplicator()
+        # NOTE: previously used _ActiveActionApplicator (the original, pre-V2
+        # ActionApplicator), which has no dispatch branches at all for
+        # cross_train_backup, swarm_item, insert_review_gate,
+        # apply_ramp_up_discount, pair_reviewer, rebaseline_estimate,
+        # escalate_blocker_early, or resequence_non_critical_item. Any
+        # RecoveryPlan (built via this SimulationEngine, e.g. RecoveryPlanEngine)
+        # that included one of those actions would silently simulate it as a
+        # no-op while still listing it and taking credit for the plan's
+        # reported probability/delay improvement. ActionApplicatorV2 is a
+        # strict superset of the old applicator's coverage plus the fixes
+        # made throughout this project -- use it everywhere instead.
+        self.applicator = ActionApplicatorV2()
         self._scenario_cache: List[ScenarioResult] = []
 
     def simulate(self, recommendation: Recommendation) -> ScenarioResult:
@@ -979,14 +990,22 @@ class ActionApplicatorV2:
                 )
 
     def _apply_reassign_item(self, state: ProjectState, rec: Recommendation) -> None:
-        resource_id = rec.affected_resource_ids[0] if rec.affected_resource_ids else None
+        sim_params = getattr(rec, "metadata", {}).get("simulation_params", {}) if getattr(rec, "metadata", None) else {}
+        # Prefer the explicit target_resource_id every real REASSIGN_ITEM candidate sets
+        # (candidate_generator.py always includes it). affected_resource_ids[0] is the
+        # CURRENT owner in every real candidate path (workload, skill-mismatch, low-velocity),
+        # not the intended receiver -- using it directly reassigns items back to themselves,
+        # a silent no-op. Fall back to affected_resource_ids[-1] only for legacy callers that
+        # never set simulation_params at all.
+        resource_id = sim_params.get("target_resource_id") or (
+            rec.affected_resource_ids[-1] if rec.affected_resource_ids else None
+        )
         if not resource_id:
             return
         target_resource = next((r for r in state.team if r.resource_id == resource_id), None)
         if target_resource is None:
             return
 
-        sim_params = getattr(rec, "metadata", {}).get("simulation_params", {}) if getattr(rec, "metadata", None) else {}
         req_skill = sim_params.get("required_skill")
 
         for item in state.work_items:
@@ -1076,9 +1095,20 @@ class ActionApplicatorV2:
                 item.assigned_resource = resource_id
 
     def _apply_remove_dependency_bottleneck(self, state: ProjectState, rec: Recommendation) -> None:
+        # Decrementing lag_days alone is a no-op for the majority of real dependencies,
+        # which have lag_days == 0 to begin with (a plain "B can't start until A finishes"
+        # coupling, no extra buffer to shave off). Mirror _apply_parallelize_items instead:
+        # loosen the successor's own effort as the primary effect, and still decrement
+        # lag_days as a secondary effect for the minority of dependencies where it's nonzero.
+        successor_ids = set()
         for dep in state.dependencies:
             if dep.predecessor_item_id in rec.affected_item_ids or dep.successor_item_id in rec.affected_item_ids:
                 dep.lag_days = max(0, dep.lag_days - 1)
+                successor_ids.add(dep.successor_item_id)
+        for item in state.work_items:
+            if item.item_id in successor_ids:
+                item.current_estimate_hrs = round(item.current_estimate_hrs * 0.9, 2)
+                item.remaining_effort_hrs = round(item.remaining_effort_hrs * 0.9, 2)
 
     def _apply_add_resource_skill(self, state: ProjectState, rec: Recommendation) -> None:
         resource_id = rec.affected_resource_ids[0] if rec.affected_resource_ids else None
