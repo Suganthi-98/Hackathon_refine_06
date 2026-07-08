@@ -100,6 +100,22 @@ class DependencyType(str, Enum):
     START_TO_START = "Start-To-Start"
 
 
+class SkillProficiency(str, Enum):
+    """
+    Depth at which a resource can perform a skill.
+
+    PRIMARY   — native expertise; the resource's main discipline.
+    SECONDARY — proficient but not the go-to person.
+    BACKUP    — can cover in an emergency; typically acquired via cross-training.
+                Recorded when CROSS_TRAIN_BACKUP is applied so the model
+                reflects that Resource B now covers Skill X without mutating
+                the primary_skill string.
+    """
+    PRIMARY = "Primary"
+    SECONDARY = "Secondary"
+    BACKUP = "Backup"
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # DOMAIN MODELS
 # ──────────────────────────────────────────────────────────────────────────────
@@ -154,6 +170,48 @@ class ProjectInfo(BaseModel):
         return self.start_date or self.release_date or self.target_end_date or datetime.utcnow()
 
 
+class SkillCoverage(BaseModel):
+    """
+    A single skill a resource can perform, at a stated proficiency level.
+
+    Populated from the workbook for PRIMARY/SECONDARY entries.
+    Written by ActionApplicatorV2._apply_cross_train_backup() with
+    proficiency=BACKUP so the domain model records that backup coverage
+    exists — without overwriting the resource's primary_skill string.
+    The forecast engine reads this list to determine whether a blocker
+    or skill-gap can be covered by a backup resource.
+    """
+    skill: str = Field(..., description="Skill name (matches required_skill on WorkItem)")
+    proficiency: SkillProficiency = Field(..., description="Depth of competence")
+    certified: bool = Field(
+        default=False,
+        description="True when the resource has formal certification for this skill",
+    )
+    acquired_via: Optional[str] = Field(
+        None,
+        description="How this coverage was gained, e.g. 'cross_training', 'workbook', 'simulation'",
+    )
+
+
+class SprintCapacityEntry(BaseModel):
+    """
+    One resource's contribution to a sprint's total capacity.
+
+    The aggregate of all entries for a sprint replaces the single
+    planned_velocity_hrs scalar as the authoritative capacity source
+    when the simulation adds or removes resource contributions.
+    planned_velocity_hrs is still computed from the workbook and kept
+    for backwards compatibility; capacity_breakdown is additive and
+    populated only when a simulation mutates sprint capacity.
+    """
+    resource_id: str = Field(..., description="Contributing resource")
+    hours: float = Field(..., ge=0.0, description="Hours contributed this sprint")
+    source: str = Field(
+        ...,
+        description="Origin of this entry: 'planned', 'cross_train', 'swarm', 'simulation'",
+    )
+
+
 class Resource(BaseModel):
     """Team member with skills and availability."""
     
@@ -173,6 +231,26 @@ class Resource(BaseModel):
         default=8.0, ge=0.0, le=24.0, description="Daily work capacity in hours"
     )
     notes: Optional[str] = Field(None, description="Additional notes about resource")
+    skill_coverage: List[SkillCoverage] = Field(
+        default_factory=list,
+        description=(
+            "All skills this resource can perform, beyond primary/secondary. "
+            "Populated from the workbook at parse time and extended by simulation "
+            "actions (e.g. CROSS_TRAIN_BACKUP adds a BACKUP entry). "
+            "Engines should check this list before concluding a resource cannot "
+            "cover a required skill."
+        ),
+    )
+
+    def covers_skill(self, skill: str) -> bool:
+        """Return True if this resource can perform the given skill at any proficiency."""
+        if self.primary_skill == skill or self.secondary_skill == skill:
+            return True
+        return any(sc.skill == skill for sc in self.skill_coverage)
+
+    def backup_skills(self) -> List[str]:
+        """Return the list of skills this resource covers at BACKUP proficiency."""
+        return [sc.skill for sc in self.skill_coverage if sc.proficiency == SkillProficiency.BACKUP]
 
 
 class Sprint(BaseModel):
@@ -188,6 +266,20 @@ class Sprint(BaseModel):
     status: SprintStatus = Field(..., description="Current sprint status")
     planned_velocity_hrs: float = Field(..., ge=0, description="Planned velocity in hours")
     carryover_count: int = Field(default=0, ge=0, description="Items carried from previous sprint")
+    capacity_breakdown: List[SprintCapacityEntry] = Field(
+        default_factory=list,
+        description=(
+            "Per-resource capacity contributions for this sprint. "
+            "Empty until a simulation action writes to it (e.g. CROSS_TRAIN_BACKUP, "
+            "SWARM_ITEM). When non-empty, the sum of entries is the simulation-adjusted "
+            "capacity; planned_velocity_hrs is the workbook baseline. "
+            "The forecast engine sums both to compute effective sprint capacity."
+        ),
+    )
+
+    def simulation_capacity_hrs(self) -> float:
+        """Return the additional simulated capacity beyond the planned baseline."""
+        return sum(e.hours for e in self.capacity_breakdown)
     
     @field_validator("end_date")
     def validate_end_after_start(cls, v: datetime, info):
@@ -217,6 +309,23 @@ class WorkItem(BaseModel):
     status: WorkItemStatus = Field(..., description="Current work item status")
     is_scope_changed: bool = Field(default=False, description="Whether scope has changed")
     scope_change_reason: Optional[str] = Field(None, description="Reason for scope change")
+    parent_item_id: Optional[str] = Field(
+        None,
+        description=(
+            "Set when this item was split from another. Points to the original item's ID. "
+            "The dependency engine uses this to automatically mark sibling splits as "
+            "parallelizable without requiring an explicit dependency edge."
+        ),
+    )
+    can_parallel_with: List[str] = Field(
+        default_factory=list,
+        description=(
+            "Item IDs that this item can run in parallel with (no sequential dependency). "
+            "Populated by SPLIT_ITEM and PARALLELIZE_ITEMS applicators. "
+            "The critical path engine reads this list when computing parallelism benefit — "
+            "items listed here are not treated as sequential even if they share a resource."
+        ),
+    )
 
 
 class Dependency(BaseModel):

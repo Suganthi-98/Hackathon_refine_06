@@ -365,6 +365,9 @@ def test_recommendation_engine_v2_rank_by_simulation_delta(monkeypatch):
 
     monkeypatch.setattr(engine, "_run_simulation", fake_run_simulation)
 
+    for rec in triaged:
+        print(rec.recommendation_id, rec.action_type, rec.affected_item_ids, rec.root_cause_signal_id)
+
     simulation_results = {rec.recommendation_id: engine._run_simulation(rec, upstream) for rec in triaged}
 
     selected = triaged[:2]

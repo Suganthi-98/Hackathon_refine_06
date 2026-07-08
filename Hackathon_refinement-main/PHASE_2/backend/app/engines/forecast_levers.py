@@ -11,16 +11,19 @@ FORECAST_LEVER_MAP: Dict[RecommendationAction, List[str]] = {
         "work_item.remaining_effort_hrs",
     ],
     RecommendationAction.CROSS_TRAIN_BACKUP: [
-        "resource.primary_skill",
-        "sprint.planned_velocity_hrs",
+        "resource.skill_coverage",       # backup peer gains a BACKUP SkillCoverage entry
+        "sprint.capacity_breakdown",     # backup peer's hours added as a SprintCapacityEntry
     ],
     RecommendationAction.SPLIT_ITEM: [
-        "work_item.remaining_effort_hrs",
-        "work_item.current_estimate_hrs",
+        "work_item.remaining_effort_hrs",  # original item's hours halved
+        "work_item.current_estimate_hrs",  # original item's estimate halved
+        "work_item.parent_item_id",        # sibling records its origin
+        "work_item.can_parallel_with",     # both items explicitly marked parallelizable
     ],
     RecommendationAction.SWARM_ITEM: [
-        "sprint.planned_velocity_hrs",
-        "work_item.remaining_effort_hrs",
+        "sprint.capacity_breakdown",     # swarm resource committed via SprintCapacityEntry
+        "work_item.can_parallel_with",   # item records the swarming resource
+        "work_item.remaining_effort_hrs",# reduced by derived parallelism factor
     ],
     RecommendationAction.REMOVE_DEPENDENCY_BOTTLENECK: [
         "dependency.lag_days",
@@ -48,8 +51,9 @@ FORECAST_LEVER_MAP: Dict[RecommendationAction, List[str]] = {
         "work_item.remaining_effort_hrs",
     ],
     RecommendationAction.ESCALATE_BLOCKER_EARLY: [
-        "blocker.target_resolution_date",
-        "work_item.remaining_effort_hrs",
+        "blocker.severity",              # unconditional — always bumped by _apply_escalate_blocker_early
+        "blocker.target_resolution_date",# conditional — pulled forward when date exists
+        "work_item.remaining_effort_hrs",# conditional — reduced when impacted_item_ids present
     ],
     RecommendationAction.PULL_FORWARD_ITEM: [
         "work_item.assigned_sprint",

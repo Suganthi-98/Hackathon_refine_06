@@ -111,7 +111,10 @@ class CandidateGenerator:
                 simulation_params={"target_blocker_id": blocker_id},
                 feasibility_checks={"blocker_active": True},
             ))
+        # Fix #4: only emit ADVANCE if an eligible earlier sprint actually exists.
         for item_id in signal.affected_item_ids[:1]:
+            if not self._can_advance_item(item_id):
+                continue
             candidates.append(self._build_candidate(
                 action_type=RecommendationAction.ADVANCE_ITEM_TO_EARLIER_SPRINT,
                 title=f"Advance item ({item_id})",
@@ -122,7 +125,7 @@ class CandidateGenerator:
                 affected_blocker_ids=blocker_ids,
                 root_signal_id=signal.signal_id,
                 simulation_params={"target_item_id": item_id},
-                feasibility_checks={"has_capacity": True},
+                feasibility_checks={"has_capacity": True, "earlier_sprint_exists": True},
             ))
         return candidates
 
@@ -182,17 +185,50 @@ class CandidateGenerator:
             return candidates
 
         if flag == "UNDERUTILIZED":
+            # Bug #6 fix: the underutilized resource is the *receiver*, not the source.
+            # The applicator does `item.assigned_resource = resource_id` — meaning the
+            # affected_item_ids must come from a *different*, overloaded resource, not from
+            # the underutilized one's own backlog (which would be a guaranteed self-reassignment
+            # no-op). Find the most overloaded peer who shares at least one sprint with this
+            # underutilized resource, then take items from *that* peer.
+            sprint_ids = set(signal.affected_sprint_ids)
+            overloaded_peers = [
+                r for r in self.project_state.team
+                if r.resource_id != resource_id
+            ]
+            # Pick the peer with the most remaining effort in the shared sprint(s)
+            def _peer_remaining_hrs(r: Any) -> float:
+                return sum(
+                    float(getattr(wi, "remaining_effort_hrs", 0.0) or 0.0)
+                    for wi in self.project_state.work_items
+                    if getattr(wi, "assigned_resource", None) in {r.resource_id, r.name}
+                    and getattr(wi, "assigned_sprint", None) in sprint_ids
+                )
+            source_peer = max(overloaded_peers, key=_peer_remaining_hrs, default=None) if overloaded_peers else None
+            if source_peer is None:
+                # No peer to pull from — don't emit a candidate that can't mutate state
+                return candidates
+            source_items = [
+                wi.item_id for wi in self.project_state.work_items
+                if getattr(wi, "assigned_resource", None) in {source_peer.resource_id, source_peer.name}
+                and getattr(wi, "assigned_sprint", None) in sprint_ids
+            ]
+            if not source_items:
+                return candidates
             candidates.append(self._build_candidate(
                 action_type=RecommendationAction.REBALANCE_SPRINT_LOAD,
-                title=f"Rebalance sprint load ({resource_id})",
-                description=f"Redistribute work away from underutilized resource {resource_id}",
-                affected_item_ids=signal.affected_item_ids[:2],
+                title=f"Rebalance sprint load → {resource_id}",
+                description=(
+                    f"{resource_id} has spare capacity (load ratio {load_ratio:.0%}); "
+                    f"move work from {source_peer.resource_id} to absorb {len(source_items)} item(s)."
+                ),
+                affected_item_ids=source_items[:2],
                 affected_resource_ids=[resource_id],
                 affected_sprint_ids=signal.affected_sprint_ids,
                 affected_blocker_ids=signal.affected_blocker_ids,
                 root_signal_id=signal.signal_id,
-                simulation_params={"target_resource_id": resource_id, "load_ratio": load_ratio},
-                feasibility_checks={"resource_exists": True, "has_capacity": True},
+                simulation_params={"target_resource_id": resource_id, "load_ratio": load_ratio, "source_resource_id": source_peer.resource_id},
+                feasibility_checks={"resource_exists": True, "has_capacity": True, "source_identified": True},
             ))
             return candidates
 
@@ -296,18 +332,20 @@ class CandidateGenerator:
         candidates: List[RecommendationCandidate] = []
         if signal.affected_item_ids:
             item_id = signal.affected_item_ids[0]
-            candidates.append(self._build_candidate(
-                action_type=RecommendationAction.ADVANCE_ITEM_TO_EARLIER_SPRINT,
-                title=f"Advance item ({item_id})",
-                description=f"Advance sprint-bound item {item_id}",
-                affected_item_ids=[item_id],
-                affected_resource_ids=[],
-                affected_sprint_ids=signal.affected_sprint_ids,
-                affected_blocker_ids=signal.affected_blocker_ids,
-                root_signal_id=signal.signal_id,
-                simulation_params={"target_item_id": item_id},
-                feasibility_checks={"has_capacity": True},
-            ))
+            # Fix #4: skip if already in the earliest eligible sprint
+            if self._can_advance_item(item_id):
+                candidates.append(self._build_candidate(
+                    action_type=RecommendationAction.ADVANCE_ITEM_TO_EARLIER_SPRINT,
+                    title=f"Advance item ({item_id})",
+                    description=f"Advance sprint-bound item {item_id}",
+                    affected_item_ids=[item_id],
+                    affected_resource_ids=[],
+                    affected_sprint_ids=signal.affected_sprint_ids,
+                    affected_blocker_ids=signal.affected_blocker_ids,
+                    root_signal_id=signal.signal_id,
+                    simulation_params={"target_item_id": item_id},
+                    feasibility_checks={"has_capacity": True, "earlier_sprint_exists": True},
+                ))
         return candidates
 
     def _from_critical_path_signal(self, signal: OpportunitySignal) -> List[RecommendationCandidate]:
@@ -345,7 +383,10 @@ class CandidateGenerator:
             ))
             return candidates
 
+        # Fix #4: only emit if an earlier eligible sprint exists for this item
         for item_id in signal.affected_item_ids[:2]:
+            if not self._can_advance_item(item_id):
+                continue
             candidates.append(self._build_candidate(
                 action_type=RecommendationAction.ADVANCE_ITEM_TO_EARLIER_SPRINT,
                 title=f"Advance item ({item_id})",
@@ -356,7 +397,7 @@ class CandidateGenerator:
                 affected_blocker_ids=signal.affected_blocker_ids,
                 root_signal_id=signal.signal_id,
                 simulation_params={"target_item_id": item_id},
-                feasibility_checks={"has_capacity": True},
+                feasibility_checks={"has_capacity": True, "earlier_sprint_exists": True},
             ))
         return candidates
 
@@ -364,13 +405,13 @@ class CandidateGenerator:
         candidates: List[RecommendationCandidate] = []
         if not signal.affected_item_ids:
             return candidates
-        
-        # Get the context flag to understand which type of schedule issue this is
+
         flag = signal.context.get("flag", "SCHEDULE_GAP") if signal.context else "SCHEDULE_GAP"
         schedule_gap_hours = float(signal.context.get("schedule_gap_hours", 0.0)) if signal.context else 0.0
-        
-        # Generate SPLIT_ITEM candidate for the first item
+
+        # SPLIT_ITEM — no resource needed; applicator works directly on the item
         item_id = signal.affected_item_ids[0]
+        item = next((wi for wi in self.project_state.work_items if wi.item_id == item_id), None)
         candidates.append(self._build_candidate(
             action_type=RecommendationAction.SPLIT_ITEM,
             title=f"Split item ({item_id})",
@@ -383,44 +424,96 @@ class CandidateGenerator:
             simulation_params={"target_item_id": item_id},
             feasibility_checks={"item_large_enough": True},
         ))
-        
-        # Generate REBALANCE_SPRINT_LOAD candidate
-        candidates.append(self._build_candidate(
-            action_type=RecommendationAction.REBALANCE_SPRINT_LOAD,
-            title="Rebalance sprint load",
-            description=f"Rebalance work items across sprints to address schedule pressure (gap: {schedule_gap_hours:.1f}h)",
-            affected_item_ids=signal.affected_item_ids[:2],  # Top 2 items
-            affected_resource_ids=[],
-            affected_sprint_ids=signal.affected_sprint_ids,
-            affected_blocker_ids=signal.affected_blocker_ids,
-            root_signal_id=signal.signal_id,
-            simulation_params={"gap_hours": schedule_gap_hours},
-            feasibility_checks={"has_future_sprints": True},
-        ))
-        
-        # Generate ADD_RESOURCE_SKILL candidate when gap is large
-        if schedule_gap_hours > 20.0:
-            # Try to infer required skill from the top affected item for a richer candidate
-            required_skill = "General"
-            if signal.affected_item_ids:
-                item_id = signal.affected_item_ids[0]
-                item = next((wi for wi in self.project_state.work_items if wi.item_id == item_id), None)
-                if item and getattr(item, "required_skill", None):
-                    required_skill = item.required_skill
 
+        # Fix #7: REBALANCE_SPRINT_LOAD requires a real target resource (the receiver).
+        # The applicator does `item.assigned_resource = resource_id` — if resource_id is
+        # empty the guard returns immediately, guaranteed no-op. Find an underutilized
+        # resource to absorb the overloaded items before emitting this candidate.
+        sprint_ids = set(signal.affected_sprint_ids)
+        def _resource_remaining_hrs(r: Any) -> float:
+            return sum(
+                float(getattr(wi, "remaining_effort_hrs", 0.0) or 0.0)
+                for wi in self.project_state.work_items
+                if getattr(wi, "assigned_resource", None) in {r.resource_id, r.name}
+                and getattr(wi, "assigned_sprint", None) in sprint_ids
+            )
+        def _resource_capacity_hrs(r: Any) -> float:
+            daily = float(getattr(r, "daily_capacity_hrs", 8.0) or 8.0)
+            avail = float(getattr(r, "availability_pct", 1.0) or 1.0)
+            return daily * avail * 10  # approximate sprint capacity (10 working days)
+
+        receiver = None
+        for r in sorted(self.project_state.team, key=lambda r: _resource_remaining_hrs(r)):
+            cap = _resource_capacity_hrs(r)
+            if cap > 0 and _resource_remaining_hrs(r) < cap * 0.8:
+                receiver = r
+                break
+
+        if receiver is not None:
             candidates.append(self._build_candidate(
-                action_type=RecommendationAction.ADD_RESOURCE_SKILL,
-                title="Add resource capacity",
-                description=f"Add resources or increase capacity to close schedule gap ({schedule_gap_hours:.1f}h)",
-                affected_item_ids=signal.affected_item_ids[:1],
-                affected_resource_ids=[],
+                action_type=RecommendationAction.REBALANCE_SPRINT_LOAD,
+                title=f"Rebalance sprint load → {receiver.resource_id}",
+                description=(
+                    f"Rebalance work to {receiver.resource_id} to close schedule gap ({schedule_gap_hours:.1f}h). "
+                    f"Items in scope: {', '.join(signal.affected_item_ids[:2])}"
+                ),
+                affected_item_ids=signal.affected_item_ids[:2],
+                affected_resource_ids=[receiver.resource_id],
                 affected_sprint_ids=signal.affected_sprint_ids,
                 affected_blocker_ids=signal.affected_blocker_ids,
                 root_signal_id=signal.signal_id,
-                simulation_params={"gap_hours": schedule_gap_hours, "required_skill": required_skill},
-                feasibility_checks={"budget_available": True},
+                simulation_params={"gap_hours": schedule_gap_hours, "target_resource_id": receiver.resource_id},
+                feasibility_checks={"has_future_sprints": True, "receiver_identified": True},
             ))
-        
+        # If no underutilized receiver exists, suppress the REBALANCE candidate — emitting
+        # it with an empty resource_id would be a guaranteed no-op.
+
+        # Fix #10: ADD_RESOURCE_SKILL requires a real resource ID in affected_resource_ids.
+        # The applicator's guard is `if resource_id is None: return`. Find the most
+        # overloaded resource with the required skill gap before emitting this candidate.
+        if schedule_gap_hours > 20.0:
+            required_skill = "General"
+            if item and getattr(item, "required_skill", None):
+                required_skill = item.required_skill
+
+            # Find the most loaded resource who would benefit from a skill/capacity boost.
+            # Prefer someone already assigned to affected items; fall back to most loaded overall.
+            skill_target = None
+            for wi_id in signal.affected_item_ids[:3]:
+                wi = next((w for w in self.project_state.work_items if w.item_id == wi_id), None)
+                if wi and getattr(wi, "assigned_resource", None):
+                    skill_target = wi.assigned_resource
+                    break
+            if skill_target is None and self.project_state.team:
+                # Fallback: resource with highest remaining effort in affected sprints
+                skill_target = max(
+                    (r.resource_id for r in self.project_state.team),
+                    key=lambda rid: sum(
+                        float(getattr(w, "remaining_effort_hrs", 0.0) or 0.0)
+                        for w in self.project_state.work_items
+                        if getattr(w, "assigned_resource", None) == rid
+                        and getattr(w, "assigned_sprint", None) in sprint_ids
+                    ),
+                    default=None,
+                )
+            if skill_target is not None:
+                candidates.append(self._build_candidate(
+                    action_type=RecommendationAction.ADD_RESOURCE_SKILL,
+                    title=f"Add resource capacity ({skill_target})",
+                    description=(
+                        f"Boost capacity or add '{required_skill}' skill for {skill_target} "
+                        f"to close schedule gap ({schedule_gap_hours:.1f}h)."
+                    ),
+                    affected_item_ids=signal.affected_item_ids[:1],
+                    affected_resource_ids=[skill_target],
+                    affected_sprint_ids=signal.affected_sprint_ids,
+                    affected_blocker_ids=signal.affected_blocker_ids,
+                    root_signal_id=signal.signal_id,
+                    simulation_params={"gap_hours": schedule_gap_hours, "required_skill": required_skill, "target_resource_id": skill_target},
+                    feasibility_checks={"budget_available": True, "resource_identified": True},
+                ))
+            # If no resource can be identified, suppress — empty resource_id is a guaranteed no-op.
+
         return candidates
 
     def _from_estimation_signal(self, signal: OpportunitySignal) -> List[RecommendationCandidate]:
@@ -596,6 +689,28 @@ class CandidateGenerator:
             feasibility_checks={"resource_exists": True},
         ))
         return candidates
+
+    # ------------------------------------------------------------------ #
+    # Shared guard: emit ADVANCE_ITEM_TO_EARLIER_SPRINT only when a real  #
+    # earlier, non-completed sprint exists for the item.                  #
+    # ------------------------------------------------------------------ #
+    def _can_advance_item(self, item_id: str) -> bool:
+        """Return True iff there is at least one earlier, eligible sprint to advance this item into."""
+        item = next((wi for wi in self.project_state.work_items if wi.item_id == item_id), None)
+        if item is None:
+            return False
+        sprint_by_name = {s.sprint_name: s for s in self.project_state.sprints}
+        current_sprint = sprint_by_name.get(item.assigned_sprint)
+        if current_sprint is None:
+            return False
+        # An eligible earlier sprint must have a lower sprint_number and not be Completed.
+        from app.domain.models import SprintStatus  # local import to avoid circular at module level
+        earlier = [
+            s for s in self.project_state.sprints
+            if s.sprint_number < current_sprint.sprint_number
+            and s.status != SprintStatus.COMPLETED
+        ]
+        return bool(earlier)
 
     def _deduplicate(self, existing: Dict[str, RecommendationCandidate], new: RecommendationCandidate) -> None:
         existing_candidate = existing.get(new.recommendation_id)

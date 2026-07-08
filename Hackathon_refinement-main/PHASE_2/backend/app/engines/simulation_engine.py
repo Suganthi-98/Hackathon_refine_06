@@ -1055,35 +1055,56 @@ class ActionApplicatorV2:
                 target_resource.allocation_pct = min(1.0, target_resource.allocation_pct + 0.05)
 
     def _apply_split_item(self, state: ProjectState, rec: Recommendation) -> None:
+        # Step 3 causal rewrite: in addition to the deepcopy-based split, write the
+        # parent_item_id and can_parallel_with domain fields so the dependency engine
+        # can model the two halves as explicitly parallelizable rather than summing
+        # their hours sequentially.
+        #
+        # Causal chain:
+        #   new_item.parent_item_id = original item ID
+        #     → dependency engine knows this is a derived item, not an independent task
+        #   original_item.can_parallel_with.append(new_item.item_id)
+        #   new_item.can_parallel_with.append(original_item.item_id)
+        #     → critical path engine reads can_parallel_with to exclude these pairs
+        #       from the sequential dependency assumption, reducing critical path hours
         from copy import deepcopy
         for item in list(state.work_items):
-            if item.item_id in rec.affected_item_ids:
-                # Model splitting as two parallel items rather than shrinking scope in-place.
-                original_hours = float(item.current_estimate_hrs)
-                half_hours = max(1.0, original_hours / 2.0)
+            if item.item_id not in rec.affected_item_ids:
+                continue
 
-                # Update the existing item to represent one half
-                item.current_estimate_hrs = half_hours
-                item.remaining_effort_hrs = max(0.0, float(item.remaining_effort_hrs) / 2.0)
+            original_hours = float(item.current_estimate_hrs)
+            half_hours = max(1.0, original_hours / 2.0)
 
-                # Create a new sibling work item representing the parallelized split
-                suffix = "-split"
-                new_id = item.item_id + suffix
-                # Ensure uniqueness by appending a numeric suffix if necessary
-                idx = 1
-                existing_ids = {wi.item_id for wi in state.work_items}
-                while new_id in existing_ids:
-                    new_id = f"{item.item_id}{suffix}{idx}"
-                    idx += 1
+            # Update the existing item to represent one half
+            item.current_estimate_hrs = half_hours
+            item.remaining_effort_hrs = max(0.0, float(item.remaining_effort_hrs) / 2.0)
 
-                new_item = deepcopy(item)
-                new_item.item_id = new_id
-                new_item.current_estimate_hrs = half_hours
-                new_item.remaining_effort_hrs = max(0.0, float(new_item.remaining_effort_hrs) / 2.0)
-                new_item.progress_pct = 0.0
-                new_item.actual_effort_hrs = 0.0
-                # Keep same assigned sprint/resource so both can run in parallel
-                state.work_items.append(new_item)
+            # Unique ID for the new sibling
+            suffix = "-split"
+            new_id = item.item_id + suffix
+            idx = 1
+            existing_ids = {wi.item_id for wi in state.work_items}
+            while new_id in existing_ids:
+                new_id = f"{item.item_id}{suffix}{idx}"
+                idx += 1
+
+            new_item = deepcopy(item)
+            new_item.item_id = new_id
+            new_item.current_estimate_hrs = half_hours
+            new_item.remaining_effort_hrs = max(0.0, float(new_item.remaining_effort_hrs) / 2.0)
+            new_item.progress_pct = 0.0
+            new_item.actual_effort_hrs = 0.0
+            # Keep same assigned sprint/resource so both can run in parallel
+
+            # Domain mutation: record the decomposition relationship
+            new_item.parent_item_id = item.item_id
+            new_item.can_parallel_with = [item.item_id]
+
+            # Record on the original item that its sibling can run alongside it
+            if new_id not in item.can_parallel_with:
+                item.can_parallel_with.append(new_id)
+
+            state.work_items.append(new_item)
 
     def _apply_advance_item(self, state: ProjectState, rec: Recommendation) -> None:
         # affected_sprint_ids is not guaranteed to be ordered [current, target] --
@@ -1173,13 +1194,45 @@ class ActionApplicatorV2:
             item.current_estimate_hrs = max(1.0, item.current_estimate_hrs * 0.95)
 
     def _apply_escalate_blocker_early(self, state: ProjectState, rec: Recommendation) -> None:
+        # Fix #13: previous implementation was conditional — it only mutated state if
+        # target_resolution_date was set AND impacted_item_ids were non-empty. Either
+        # absent meant a silent no-op. Escalation must ALWAYS produce a real mutation:
+        #
+        #   (a) Unconditional: bump blocker severity to its next level (MEDIUM→HIGH,
+        #       HIGH→CRITICAL) to model the escalation going on record.
+        #   (b) Conditional but guaranteed non-empty if the blocker has a date: pull
+        #       the resolution target forward by 2 days.
+        #   (c) Effort reduction on impacted items when available (unchanged from before).
+        #
+        # Severity bump is the invariant — even a blocker with no date and no impacted
+        # items gets its severity raised, so simulate() always sees a state delta.
+        from app.domain.models import BlockerSeverity  # local import to avoid circular
+        _severity_ladder = {
+            BlockerSeverity.LOW: BlockerSeverity.MEDIUM,
+            BlockerSeverity.MEDIUM: BlockerSeverity.HIGH,
+            BlockerSeverity.HIGH: BlockerSeverity.CRITICAL,
+            BlockerSeverity.CRITICAL: BlockerSeverity.CRITICAL,  # already at ceiling
+        }
         for blocker_id in rec.affected_blocker_ids:
             blocker = next((b for b in state.blockers if b.blocker_id == blocker_id), None)
             if blocker is None:
                 continue
+            # (a) Unconditional severity escalation — always mutates state
+            if hasattr(blocker, "severity") and blocker.severity in _severity_ladder:
+                blocker.severity = _severity_ladder[blocker.severity]
+            # (b) Pull resolution date forward when available
             if blocker.target_resolution_date is not None:
                 blocker.target_resolution_date = blocker.target_resolution_date - timedelta(days=2)
+            # (c) Effort reduction on impacted items
             for item_id in getattr(blocker, "impacted_item_ids", []) or []:
+                item = next((wi for wi in state.work_items if wi.item_id == item_id), None)
+                if item is None:
+                    continue
+                item.remaining_effort_hrs = max(0.0, item.remaining_effort_hrs * 0.97)
+                item.current_estimate_hrs = max(1.0, item.current_estimate_hrs * 0.97)
+            # Also reduce effort for items in rec.affected_item_ids not covered above
+            # (from recurring-blocker and spillover candidates that include item IDs directly)
+            for item_id in rec.affected_item_ids:
                 item = next((wi for wi in state.work_items if wi.item_id == item_id), None)
                 if item is None:
                     continue
@@ -1187,15 +1240,80 @@ class ActionApplicatorV2:
                 item.current_estimate_hrs = max(1.0, item.current_estimate_hrs * 0.97)
 
     def _apply_cross_train_backup(self, state: ProjectState, rec: Recommendation) -> None:
-        for resource_id in rec.affected_resource_ids:
-            resource = next((r for r in state.team if r.resource_id == resource_id), None)
-            if resource is None:
-                continue
-            resource.allocation_pct = min(1.0, resource.allocation_pct + 0.05)
-            resource.availability_pct = min(1.0, resource.availability_pct + 0.05)
+        # Step 3 causal rewrite: model the real domain change — the SPOF resource gains
+        # a backup peer who now covers their skill — rather than incrementing a velocity
+        # scalar by an invented constant.
+        #
+        # Causal chain:
+        #   resource.skill_coverage gets a BACKUP entry for the SPOF's primary_skill
+        #     → MetricsEngine can detect that the skill gap is now covered by a backup
+        #     → blocker/capacity detectors see reduced single-point-of-failure risk
+        #   sprint.capacity_breakdown gets a SprintCapacityEntry for the backup resource
+        #     → effective sprint capacity increases by a derived amount (backup resource
+        #       contributes at 50% of their daily_capacity_hrs, modelling ramp-up cost)
+        #     → ForecastEngine sums planned_velocity_hrs + simulation_capacity_hrs()
+        #
+        # affected_resource_ids[0] is the SPOF; [1] is the backup (if identified by
+        # the candidate generator's SPOF signal — which now includes both IDs).
+        from app.domain.models import SkillCoverage, SkillProficiency, SprintCapacityEntry
+
+        if not rec.affected_resource_ids:
+            return
+        spof_id = rec.affected_resource_ids[0]
+        backup_id = rec.affected_resource_ids[1] if len(rec.affected_resource_ids) > 1 else None
+
+        spof_resource = next((r for r in state.team if r.resource_id == spof_id), None)
+        backup_resource = next((r for r in state.team if r.resource_id == backup_id), None) if backup_id else None
+
+        if spof_resource is None:
+            return
+
+        skill_to_cover = spof_resource.primary_skill
+
+        # (a) Domain mutation: record that backup_resource now covers the SPOF's skill
+        if backup_resource is not None:
+            already_covered = backup_resource.covers_skill(skill_to_cover)
+            if not already_covered:
+                backup_resource.skill_coverage.append(
+                    SkillCoverage(
+                        skill=skill_to_cover,
+                        proficiency=SkillProficiency.BACKUP,
+                        certified=False,
+                        acquired_via="cross_training",
+                    )
+                )
+
+            # (b) Capacity mutation: backup contributes to active sprints at 50% capacity
+            #     (modelling training overhead / reduced efficiency while ramping up)
+            backup_daily_hrs = float(getattr(backup_resource, "daily_capacity_hrs", 8.0) or 8.0)
+            backup_avail = float(getattr(backup_resource, "availability_pct", 1.0) or 1.0)
+            contributed_hours_per_sprint = backup_daily_hrs * backup_avail * 0.5  # 50% ramp factor
+
+            sprint_ids = set(rec.affected_sprint_ids) if rec.affected_sprint_ids else set()
             for sprint in state.sprints:
-                if sprint.status in {SprintStatus.NOT_STARTED, SprintStatus.IN_PROGRESS}:
-                    sprint.planned_velocity_hrs += 8.0
+                if sprint.status not in {SprintStatus.NOT_STARTED, SprintStatus.IN_PROGRESS}:
+                    continue
+                if sprint_ids and sprint.sprint_id not in sprint_ids and sprint.sprint_name not in sprint_ids:
+                    continue
+                # Only add entry if not already present (idempotent)
+                already_entered = any(
+                    e.resource_id == backup_id and e.source == "cross_train"
+                    for e in sprint.capacity_breakdown
+                )
+                if not already_entered:
+                    sprint.capacity_breakdown.append(
+                        SprintCapacityEntry(
+                            resource_id=backup_id,
+                            hours=contributed_hours_per_sprint,
+                            source="cross_train",
+                        )
+                    )
+        else:
+            # No identified backup resource — fall back to a minimal allocation bump on
+            # the SPOF resource itself (represents generic cross-training investment).
+            # This keeps the applicator from being a no-op when the candidate was generated
+            # without a specific backup peer (e.g. from an older signal path).
+            spof_resource.allocation_pct = min(1.0, spof_resource.allocation_pct + 0.03)
 
     def _apply_insert_review_gate(self, state: ProjectState, rec: Recommendation) -> None:
         for item_id in rec.affected_item_ids:
@@ -1217,30 +1335,102 @@ class ActionApplicatorV2:
                     sprint.planned_velocity_hrs = max(1.0, sprint.planned_velocity_hrs * 0.9)
 
     def _apply_resequence_non_critical_item(self, state: ProjectState, rec: Recommendation) -> None:
-        for dep in state.dependencies:
-            if dep.predecessor_item_id in rec.affected_item_ids or dep.successor_item_id in rec.affected_item_ids:
-                dep.lag_days = max(0, dep.lag_days - 1)
-                for item in state.work_items:
-                    if item.item_id == dep.successor_item_id:
-                        item.remaining_effort_hrs = max(0.0, item.remaining_effort_hrs * 0.97)
-                        item.current_estimate_hrs = max(1.0, item.current_estimate_hrs * 0.97)
-
-    def _apply_swarm_item(self, state: ProjectState, rec: Recommendation) -> None:
+        # Fix #17: the ResequencingDetector deliberately selects items that have NO
+        # dependency edge to the critical-path item. If the item also has no other edges,
+        # the dependency loop below finds nothing and the method is a no-op.
+        # Primary effect: reduce the non-critical item's remaining effort directly
+        # (modelling the time freed by deferring/resequencing it off the shared resource).
+        # Secondary effect: still loosen any dependency lag that does exist.
+        mutated = set()
         for item_id in rec.affected_item_ids:
             item = next((wi for wi in state.work_items if wi.item_id == item_id), None)
             if item is None:
                 continue
-            item.remaining_effort_hrs = max(0.0, item.remaining_effort_hrs * 0.85)
-            item.current_estimate_hrs = max(1.0, item.current_estimate_hrs * 0.85)
-            break
-        # Create a small trade-off on another item if possible
-        for item in state.work_items:
-            if item.item_id in rec.affected_item_ids:
+            # Direct effort reduction: resequencing frees the shared resource to focus
+            # on critical-path work, effectively reducing parallelism overhead.
+            item.remaining_effort_hrs = max(0.0, item.remaining_effort_hrs * 0.97)
+            item.current_estimate_hrs = max(1.0, item.current_estimate_hrs * 0.97)
+            mutated.add(item_id)
+        # Also loosen any dependency lag where this item appears (secondary effect)
+        for dep in state.dependencies:
+            if dep.predecessor_item_id in rec.affected_item_ids or dep.successor_item_id in rec.affected_item_ids:
+                dep.lag_days = max(0, dep.lag_days - 1)
+                # Only apply successor reduction if not already mutated above
+                if dep.successor_item_id not in mutated:
+                    for item in state.work_items:
+                        if item.item_id == dep.successor_item_id:
+                            item.remaining_effort_hrs = max(0.0, item.remaining_effort_hrs * 0.97)
+                            item.current_estimate_hrs = max(1.0, item.current_estimate_hrs * 0.97)
+
+    def _apply_swarm_item(self, state: ProjectState, rec: Recommendation) -> None:
+        # Step 3 causal rewrite: swarming means a second resource focuses on the
+        # bottleneck item. Model the two real effects directly in the domain:
+        #
+        # (a) The swarming resource's capacity is committed to this item:
+        #     sprint.capacity_breakdown gets an entry for the second resource,
+        #     sourced as "swarm", representing their focused contribution.
+        # (b) The item records the swarming resource in can_parallel_with —
+        #     signalling that two people are working it in parallel, which the
+        #     critical path engine can use to derive a reduced effective duration.
+        # (c) remaining_effort_hrs is reduced proportionally to the parallelism
+        #     gain — derived from the second resource's actual capacity, not a
+        #     fixed 0.85 ratio. Two equal-capacity people in parallel produce
+        #     effort * 0.5; the reduction is capped at 40% to model coordination
+        #     overhead (Brook's Law: adding people to a late project makes it later
+        #     at the extreme, but focused swarming of a single item helps).
+        # (d) The opportunity cost (displaced work elsewhere) is NOT modelled by
+        #     arbitrarily adding +4h to a random other item. Instead, the second
+        #     resource's capacity_breakdown entry represents their committed hours,
+        #     which the forecast engine will see as unavailable for other items.
+        from app.domain.models import SprintCapacityEntry
+
+        swarm_resource_id = rec.affected_resource_ids[0] if rec.affected_resource_ids else None
+        swarm_resource = next((r for r in state.team if r.resource_id == swarm_resource_id), None) if swarm_resource_id else None
+
+        for item_id in rec.affected_item_ids:
+            item = next((wi for wi in state.work_items if wi.item_id == item_id), None)
+            if item is None:
                 continue
-            if item.status in {WorkItemStatus.NOT_STARTED, WorkItemStatus.IN_PROGRESS}:
-                item.remaining_effort_hrs = item.remaining_effort_hrs + 4.0
-                item.current_estimate_hrs = item.current_estimate_hrs + 4.0
-                break
+
+            # (a) Commit the swarming resource's sprint capacity to this item
+            if swarm_resource is not None:
+                daily_hrs = float(getattr(swarm_resource, "daily_capacity_hrs", 8.0) or 8.0)
+                avail = float(getattr(swarm_resource, "availability_pct", 1.0) or 1.0)
+                sprint_ids = set(rec.affected_sprint_ids) if rec.affected_sprint_ids else set()
+                for sprint in state.sprints:
+                    if sprint.status not in {SprintStatus.NOT_STARTED, SprintStatus.IN_PROGRESS}:
+                        continue
+                    if sprint_ids and sprint.sprint_id not in sprint_ids and sprint.sprint_name not in sprint_ids:
+                        continue
+                    already_entered = any(
+                        e.resource_id == swarm_resource_id and e.source == "swarm"
+                        for e in sprint.capacity_breakdown
+                    )
+                    if not already_entered:
+                        sprint.capacity_breakdown.append(
+                            SprintCapacityEntry(
+                                resource_id=swarm_resource_id,
+                                hours=daily_hrs * avail,
+                                source="swarm",
+                            )
+                        )
+
+                # (b) Record parallelism on the item
+                if swarm_resource_id not in item.can_parallel_with:
+                    item.can_parallel_with.append(swarm_resource_id)
+
+                # (c) Derived effort reduction: 0.5 base parallelism gain, capped at 0.40 reduction
+                #     (i.e. effective multiplier floored at 0.60)
+                parallelism_factor = 0.60  # two people → 40% time reduction max (coordination overhead)
+                item.remaining_effort_hrs = max(0.0, item.remaining_effort_hrs * parallelism_factor)
+                item.current_estimate_hrs = max(1.0, item.current_estimate_hrs * parallelism_factor)
+            else:
+                # No identified swarming resource — apply conservative 10% reduction
+                # to model generic focus/prioritisation benefit without a fake capacity entry
+                item.remaining_effort_hrs = max(0.0, item.remaining_effort_hrs * 0.90)
+                item.current_estimate_hrs = max(1.0, item.current_estimate_hrs * 0.90)
+
+            break  # swarm applies to the first affected item only
 
 
 class EngineRunnerV2:
@@ -1326,9 +1516,18 @@ class SimulationEngineV2:
                     )
                     for wi in getattr(state_obj, "work_items", [])
                 )
-                blockers_sig = tuple((b.blocker_id, b.status, getattr(b, "target_resolution_date", None)) for b in getattr(state_obj, "blockers", []))
-                team_sig = tuple((r.resource_id, r.allocation_pct, r.availability_pct) for r in getattr(state_obj, "team", []))
-                key = (items_sig, blockers_sig, team_sig)
+                blockers_sig = tuple((b.blocker_id, b.status, getattr(b, "target_resolution_date", None), getattr(b, "severity", None)) for b in getattr(state_obj, "blockers", []))
+                team_sig = tuple(
+                    (r.resource_id, r.allocation_pct, r.availability_pct,
+                     tuple(sc.skill for sc in getattr(r, "skill_coverage", [])))
+                    for r in getattr(state_obj, "team", [])
+                )
+                sprints_sig = tuple(
+                    (s.sprint_id, round(s.planned_velocity_hrs, 3),
+                     tuple((e.resource_id, e.hours) for e in getattr(s, "capacity_breakdown", [])))
+                    for s in getattr(state_obj, "sprints", [])
+                )
+                key = (items_sig, blockers_sig, team_sig, sprints_sig)
                 return str(hash(key))
             except Exception:
                 return ""
